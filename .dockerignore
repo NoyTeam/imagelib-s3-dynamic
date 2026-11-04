@@ -1,0 +1,13 @@
+# Only cmd/, internal/, gen/, schema/, go.mod and go.sum are needed to build.
+.git
+.github
+.env*
+*.bak
+data/
+test/
+scripts/
+docker-compose*.yml
+Dockerfile
+*.md
+cmd/loadtest/
+**/*_test.go

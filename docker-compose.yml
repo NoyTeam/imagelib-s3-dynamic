@@ -1,0 +1,98 @@
+name: imagelib
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "5"
+
+services:
+  imagelib:
+    build: .
+    image: ${IMAGELIB_IMAGE:-imagelib:latest}
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      # Wiring to the bundled services; these override anything in .env.production.
+      ADDR: ":8080"
+      LOCAL_PATH: /data
+      DATABASE_URL: postgres://imagelib:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/imagelib?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    volumes:
+      # Host image directory (the source of truth). imagelib only reads it.
+      - type: bind
+        source: ${HOST_LOCAL_PATH:?set HOST_LOCAL_PATH to the host image directory}
+        target: /data
+        read_only: true
+        bind:
+          create_host_path: false
+    ports:
+      # Put a CDN / reverse proxy in front; bind to all interfaces with IMAGELIB_BIND=0.0.0.0:8080.
+      - "${IMAGELIB_BIND:-127.0.0.1:8080}:8080"
+    # Must be able to read the mounted files (default: distroless nonroot 65532).
+    user: "${IMAGELIB_UID:-65532}:${IMAGELIB_GID:-65532}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 30s
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    healthcheck:
+      test: ["CMD", "/imagelib", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging: *logging
+
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: imagelib
+      POSTGRES_DB: imagelib
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      # postgres >= 18 images keep data under /var/lib/postgresql/<major>/docker: mount the parent.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "imagelib", "-d", "imagelib"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    shm_size: 256mb
+    logging: *logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDISCLI_AUTH: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    # AOF persistence keeps the index across restarts (PG can rebuild it, but that's slower).
+    # noeviction: partial key eviction would only be repaired by the reconciler.
+    command:
+      - redis-server
+      - --requirepass
+      - ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      - --appendonly
+      - "yes"
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *logging
+
+volumes:
+  pgdata:
+  redisdata:

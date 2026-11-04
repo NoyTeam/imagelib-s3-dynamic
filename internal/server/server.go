@@ -33,6 +33,9 @@ func New(db *sql.DB, rdb *redis.Client, images http.Handler) *Server {
 
 	s.e.Use(middleware.Recover())
 	s.e.GET("/healthz", s.healthz)
+	s.e.GET("/livez", func(c *echo.Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
 	if images != nil {
 		// Static routes (e.g. /healthz) take precedence over the wildcard.
 		s.e.Any("/*", echo.WrapHandler(images))

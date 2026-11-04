@@ -251,10 +251,58 @@ An invalid value aborts startup with a message that names the variable.
 
 ## Deployment
 
+### Docker Compose (recommended)
+
+`docker-compose.yml` runs imagelib together with PostgreSQL 18 and Redis 7. The S3 tier is your
+external bucket (e.g. Backblaze B2). The host image directory is bind-mounted **read-only** at
+`/data`; imagelib never writes to it.
+
+```sh
+cp .env.production.example .env.production   # gitignored; keep it private
+# edit: HOST_LOCAL_PATH, POSTGRES_PASSWORD, REDIS_PASSWORD, S3_* and B2_* keys
+docker compose --env-file .env.production up -d --build
+docker compose --env-file .env.production ps    # imagelib should become "healthy"
+```
+
+- Always pass `--env-file .env.production`. Compose uses it for `${...}` substitution
+  (host path, passwords, bind address) and refuses to start if a required value is missing.
+- `DATABASE_URL`, `REDIS_ADDR`, `REDIS_PASSWORD`, `LOCAL_PATH` and `ADDR` are wired to the
+  bundled services by the compose file.
+- imagelib listens on `IMAGELIB_BIND` (default `127.0.0.1:8080`); put your CDN or reverse proxy
+  in front. PostgreSQL and Redis are not published to the host.
+- PostgreSQL and Redis data live in the `pgdata` and `redisdata` volumes. Redis runs with a
+  password, AOF persistence and `maxmemory-policy noeviction`.
+- The container runs as uid `65532` with a read-only root filesystem and all capabilities
+  dropped. **The mounted files must be readable by that uid**: world-readable files (`644`,
+  directories `755`) work as-is. Otherwise set `IMAGELIB_UID`/`IMAGELIB_GID` to the owner of the
+  files.
+- Health checks use `/livez` (process liveness). `/healthz` reports dependency state and is
+  meant for monitoring; it is deliberately not used to restart the container.
+- To use an existing PostgreSQL or Redis, remove the bundled service and its `depends_on`
+  entry, and set `DATABASE_URL` / `REDIS_*` in the `environment:` block.
+
+`docker-compose.dev.yml` (with a local S3 server, pgsty/silo) is for development and tests only.
+
+### Docker image only
+
+```sh
+docker build -t imagelib .            # multi-arch: docker buildx build --platform linux/amd64,linux/arm64 …
+docker run -d --name imagelib -p 8080:8080 \
+  -v /srv/images:/data:ro --env-file .env.production \
+  -e DATABASE_URL=postgres://… -e REDIS_ADDR=… imagelib
+```
+
+The image is about 18 MB: a static binary on `gcr.io/distroless/static-debian12:nonroot`, which
+includes CA certificates for HTTPS to the bucket.
+
+### Binary
+
 ```sh
 go build -o imagelib ./cmd
 ./imagelib            # reads .env from the working directory, if present
 ```
+
+### Topologies
 
 | Topology | Setup |
 |---|---|
@@ -281,6 +329,9 @@ go build -o imagelib ./cmd
 ## Operations
 
 ### Health
+
+`GET /livez` returns `200` while the process serves HTTP; it backs the container health check.
+`imagelib healthcheck` performs the same probe from inside the container.
 
 `GET /healthz` returns `200` when PostgreSQL and Redis are reachable, and `503` otherwise.
 An open circuit breaker is reported but keeps `200`, because the service still serves
@@ -385,10 +436,13 @@ internal/
   storage/             local root (os.Root) and S3 client
   config/              environment parsing and validation
   database/ cache/     PostgreSQL (incl. embedded schema push) and Redis clients
-  server/              Echo server, /healthz
+  server/              Echo server, /healthz, /livez
 schema/                .gcorm schema (embedded)
 gen/                   generated GCORM client (do not edit)
 scripts/bench.sh       end-to-end load scenarios
+Dockerfile             production image (distroless, non-root)
+docker-compose.yml     production stack: imagelib + PostgreSQL + Redis, external bucket
+.env.production.example production configuration template
 docker-compose.dev.yml PostgreSQL, Redis, pgsty/silo for development and tests
 ```
 

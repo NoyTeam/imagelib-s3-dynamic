@@ -106,6 +106,13 @@ func TestImageRoutesAndSchedulerOnlyMode(t *testing.T) {
 
 	images := &stubImages{}
 	s := New(unreachablePG(t), rdb, images)
+	// /livez answers even though PG is unreachable.
+	rec := httptest.NewRecorder()
+	s.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/livez", nil))
+	if rec.Code != http.StatusOK || images.calls != 0 {
+		t.Fatalf("/livez: %d (image handler calls %d)", rec.Code, images.calls)
+	}
+
 	for _, p := range []string{"/a.png", "/deep/path/b.jpg", "/healthz/x.png"} {
 		rec := httptest.NewRecorder()
 		s.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, p, nil))
@@ -116,7 +123,7 @@ func TestImageRoutesAndSchedulerOnlyMode(t *testing.T) {
 
 	// ROLE=scheduler: no image routes at all.
 	s = New(unreachablePG(t), rdb, nil)
-	rec := httptest.NewRecorder()
+	rec = httptest.NewRecorder()
 	s.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/a.png", nil))
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("scheduler-only must not serve images, got %d", rec.Code)
