@@ -48,7 +48,7 @@ func main() {
 	}
 }
 
-// ---------------------------------------------------------------------------- gen
+// --- gen ---
 
 type object struct {
 	Key  string
@@ -124,7 +124,7 @@ func loadManifest(path string, limit int) []object {
 	return objs
 }
 
-// ---------------------------------------------------------------------------- run
+// --- run ---
 
 type sample struct {
 	at    time.Duration // since start

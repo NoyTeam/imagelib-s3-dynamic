@@ -65,6 +65,10 @@ func (i *Index) Contains(ctx context.Context, key string) (bool, error) {
 	return n, err
 }
 
+// scanBatch bounds every single Redis command issued for bulk work (HSCAN COUNT, HSET/ZADD
+// fields per command), keeping each command's execution time short.
+const scanBatch = 1000
+
 // ErrNotInitialized is returned by writes while the index is lost (e.g. Redis was flushed).
 // Writing then would make a partial index look valid; the leader rebuilds it from PG instead.
 var ErrNotInitialized = errors.New("s3 index not initialized")
@@ -137,7 +141,7 @@ func (i *Index) All(ctx context.Context) (map[string]int64, error) {
 	out := make(map[string]int64)
 	var cursor uint64
 	for {
-		kv, next, err := i.rdb.HScan(ctx, i.keys.Objects, cursor, "", 1000).Result()
+		kv, next, err := i.rdb.HScan(ctx, i.keys.Objects, cursor, "", scanBatch).Result()
 		if err != nil {
 			return nil, err
 		}
@@ -151,22 +155,100 @@ func (i *Index) All(ctx context.Context) (map[string]int64, error) {
 	}
 }
 
-var recountScript = redis.NewScript(`
-if redis.call('EXISTS', KEYS[3]) == 0 then return redis.error_reply('NOINDEX') end
-local total = 0
-for _, v in ipairs(redis.call('HVALS', KEYS[1])) do total = total + tonumber(v) end
-local old = tonumber(redis.call('GET', KEYS[2]) or '0')
-if old ~= total then redis.call('SET', KEYS[2], total) end
-return {old, total}
+// ScanKeys calls fn with batches of indexed keys (incremental HSCAN; a key may be seen twice
+// if the hash is resized during the scan, which callers tolerate).
+func (i *Index) ScanKeys(ctx context.Context, fn func(keys []string) error) error {
+	var cursor uint64
+	for {
+		kv, next, err := i.rdb.HScan(ctx, i.keys.Objects, cursor, "", scanBatch).Result()
+		if err != nil {
+			return err
+		}
+		if len(kv) > 0 {
+			keys := make([]string, 0, len(kv)/2)
+			for j := 0; j < len(kv); j += 2 {
+				keys = append(keys, kv[j])
+			}
+			if err := fn(keys); err != nil {
+				return err
+			}
+		}
+		if cursor = next; cursor == 0 {
+			return nil
+		}
+	}
+}
+
+// SumSizes adds up all indexed sizes with incremental HSCAN (never blocks Redis for long).
+// The result is only exact if no index writes happen concurrently; callers serialise.
+func (i *Index) SumSizes(ctx context.Context) (int64, error) {
+	var total int64
+	var cursor uint64
+	for {
+		kv, next, err := i.rdb.HScan(ctx, i.keys.Objects, cursor, "", scanBatch).Result()
+		if err != nil {
+			return 0, err
+		}
+		for j := 1; j < len(kv); j += 2 {
+			n, _ := strconv.ParseInt(kv[j], 10, 64)
+			total += n
+		}
+		if cursor = next; cursor == 0 {
+			return total, nil
+		}
+	}
+}
+
+var setBytesScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[2]) == 0 then return redis.error_reply('NOINDEX') end
+return redis.call('SET', KEYS[1], ARGV[1])
 `)
 
-// Recount atomically recomputes the bytes counter from the object sizes.
-func (i *Index) Recount(ctx context.Context) (before, after int64, err error) {
-	res, err := recountScript.Run(ctx, i.rdb, []string{i.keys.Objects, i.keys.Bytes, i.keys.Epoch}).Int64Slice()
-	if err != nil {
-		return 0, 0, mapScriptErr(err)
+// SetBytes overwrites the bytes counter (used after a recount).
+func (i *Index) SetBytes(ctx context.Context, n int64) error {
+	return mapScriptErr(setBytesScript.Run(ctx, i.rdb, []string{i.keys.Bytes, i.keys.Epoch}, n).Err())
+}
+
+// Sizes returns the indexed size of each key (-1 when not indexed) with one HMGET.
+func (i *Index) Sizes(ctx context.Context, keys []string) ([]int64, error) {
+	out := make([]int64, len(keys))
+	if len(keys) == 0 {
+		return out, nil
 	}
-	return res[0], res[1], nil
+	vals, err := i.rdb.HMGet(ctx, i.keys.Objects, keys...).Result()
+	if err != nil {
+		return nil, err
+	}
+	for j, v := range vals {
+		out[j] = -1
+		if s, ok := v.(string); ok {
+			out[j], _ = strconv.ParseInt(s, 10, 64)
+		}
+	}
+	return out, nil
+}
+
+// TrashedAmong returns which of keys are waiting for deletion (one pipelined round trip).
+func (i *Index) TrashedAmong(ctx context.Context, keys []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	cmds, err := i.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+		for _, k := range keys {
+			p.ZScore(ctx, i.keys.Trash, k)
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	for j, c := range cmds {
+		if c.Err() == nil {
+			out[keys[j]] = true
+		}
+	}
+	return out, nil
 }
 
 // InTrash reports whether key is waiting for deletion.
@@ -223,15 +305,58 @@ type Entry struct {
 	LastAccess time.Time
 }
 
-// Rebuild replaces the index content with entries.
+// Rebuild replaces the index content with entries (small sets / tests).
 func (i *Index) Rebuild(ctx context.Context, entries []Entry) error {
-	var total int64
-	_, err := i.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
-		p.Del(ctx, i.keys.Objects, i.keys.LRU)
-		for _, e := range entries {
-			p.HSet(ctx, i.keys.Objects, e.Key, e.Size)
-			p.ZAdd(ctx, i.keys.LRU, redis.Z{Score: float64(e.LastAccess.UnixMilli()), Member: e.Key})
-			total += e.Size
+	return i.RebuildFrom(ctx, func(yield func([]Entry) error) error {
+		if len(entries) == 0 {
+			return nil
+		}
+		return yield(entries)
+	})
+}
+
+// RebuildFrom replaces the index with the entries produced by source, page by page.
+//
+// Pages are written to temporary keys with pipelined, bounded commands; the live keys are
+// then swapped in one short transaction (UNLINK frees the old values in the background,
+// RENAME is O(1)). Redis is never blocked for long and readers see either the old or the
+// new index, never a half-built one.
+func (i *Index) RebuildFrom(ctx context.Context, source func(yield func([]Entry) error) error) error {
+	tmpObjects, tmpLRU := i.keys.Objects+":rebuild", i.keys.LRU+":rebuild"
+	if err := i.rdb.Unlink(ctx, tmpObjects, tmpLRU).Err(); err != nil {
+		return err
+	}
+	var total, count int64
+	err := source(func(page []Entry) error {
+		for start := 0; start < len(page); start += scanBatch {
+			chunk := page[start:min(start+scanBatch, len(page))]
+			fields := make([]any, 0, len(chunk)*2)
+			members := make([]redis.Z, 0, len(chunk))
+			for _, e := range chunk {
+				fields = append(fields, e.Key, e.Size)
+				members = append(members, redis.Z{Score: float64(e.LastAccess.UnixMilli()), Member: e.Key})
+				total += e.Size
+			}
+			if _, err := i.rdb.Pipelined(ctx, func(p redis.Pipeliner) error {
+				p.HSet(ctx, tmpObjects, fields...)
+				p.ZAdd(ctx, tmpLRU, members...)
+				return nil
+			}); err != nil {
+				return err
+			}
+			count += int64(len(chunk))
+		}
+		return nil
+	})
+	if err != nil {
+		i.rdb.Unlink(context.Background(), tmpObjects, tmpLRU)
+		return err
+	}
+	_, err = i.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		p.Unlink(ctx, i.keys.Objects, i.keys.LRU)
+		if count > 0 {
+			p.Rename(ctx, tmpObjects, i.keys.Objects)
+			p.Rename(ctx, tmpLRU, i.keys.LRU)
 		}
 		p.Set(ctx, i.keys.Bytes, strconv.FormatInt(total, 10), 0)
 		p.Set(ctx, i.keys.Epoch, strconv.FormatInt(time.Now().UnixMilli(), 10), 0)

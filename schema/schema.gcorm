@@ -21,6 +21,6 @@ model Image {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 
-  @@index([status])
+  @@index([key], name: "idx_images_s3_key", where: "status = 's3'")
   @@map("images")
 }

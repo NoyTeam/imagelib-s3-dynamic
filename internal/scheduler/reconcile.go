@@ -5,6 +5,8 @@ import (
 	"errors"
 	"log/slog"
 	"time"
+
+	"imagelib-s3-dynamic/internal/state"
 )
 
 // reconcileLoop periodically repairs drift between PG (durable truth), the Redis index and
@@ -45,31 +47,19 @@ func (s *Scheduler) reconcile(ctx context.Context) error {
 	start := s.now()
 	var rep reconcileReport
 
-	// 1. PG ↔ Redis index. Snapshots are not atomic, so every difference is re-verified
-	//    per key under the key lock before acting.
-	pgS3, err := s.store.listS3(ctx)
-	if err != nil {
+	// 1. PG ↔ Redis index, streamed in pages with one batched lookup per page on the other
+	//    side, so memory and per-command time stay bounded with millions of objects.
+	//    Snapshots are not atomic: every difference is re-verified under the key lock.
+	if err := s.reconcilePGToIndex(ctx, &rep); err != nil {
 		return err
 	}
-	indexed, err := s.index.All(ctx)
-	if err != nil {
+	if err := s.reconcileIndexToPG(ctx, &rep); err != nil {
 		return err
-	}
-	inPG := make(map[string]struct{}, len(pgS3))
-	for _, e := range pgS3 {
-		inPG[e.Key] = struct{}{}
-		if _, ok := indexed[e.Key]; !ok {
-			s.reconcileKey(ctx, e.Key, &rep)
-		}
-	}
-	for key := range indexed {
-		if _, ok := inPG[key]; !ok {
-			s.reconcileKey(ctx, key, &rep)
-		}
 	}
 
 	// 2. Bytes counter drift.
-	rep.bytesBefore, rep.bytesAfter, err = s.index.Recount(ctx)
+	var err error
+	rep.bytesBefore, rep.bytesAfter, err = s.recount(ctx)
 	if err != nil {
 		return err
 	}
@@ -94,6 +84,48 @@ func (s *Scheduler) reconcile(ctx context.Context) error {
 	}
 	return nil
 }
+
+// reconcilePGToIndex finds S3 rows in PG that are missing from the index.
+func (s *Scheduler) reconcilePGToIndex(ctx context.Context, rep *reconcileReport) error {
+	return s.store.forEachS3(ctx, func(page []state.Entry) error {
+		for start := 0; start < len(page); start += reconcileBatch {
+			chunk := page[start:min(start+reconcileBatch, len(page))]
+			keys := make([]string, len(chunk))
+			for i, e := range chunk {
+				keys[i] = e.Key
+			}
+			sizes, err := s.index.Sizes(ctx, keys)
+			if err != nil {
+				return err
+			}
+			for i, n := range sizes {
+				if n < 0 {
+					s.reconcileKey(ctx, keys[i], rep)
+				}
+			}
+		}
+		return ctx.Err()
+	})
+}
+
+// reconcileIndexToPG finds indexed keys that PG does not consider S3-resident.
+func (s *Scheduler) reconcileIndexToPG(ctx context.Context, rep *reconcileReport) error {
+	return s.index.ScanKeys(ctx, func(keys []string) error {
+		inPG, err := s.store.filterS3(ctx, keys)
+		if err != nil {
+			return err
+		}
+		for _, k := range keys {
+			if _, ok := inPG[k]; !ok {
+				s.reconcileKey(ctx, k, rep)
+			}
+		}
+		return ctx.Err()
+	})
+}
+
+// reconcileBatch is the number of keys checked per batched Redis/PG lookup.
+const reconcileBatch = 1000
 
 // reconcileKey makes the index agree with PG for one key.
 func (s *Scheduler) reconcileKey(ctx context.Context, key string, rep *reconcileReport) {
@@ -149,13 +181,39 @@ func (s *Scheduler) reconcileKey(ctx context.Context, key string, rep *reconcile
 	}
 }
 
-var errStopList = errors.New("stop listing")
-
 // reconcileOrphans finds bucket objects under the prefix that are neither indexed nor
-// waiting in the trash (e.g. uploads whose PG/Redis commit was lost in a crash).
+// waiting in the trash (e.g. uploads whose PG/Redis commit was lost in a crash). The bucket
+// listing is processed in batches: one HMGET + one pipelined trash lookup per batch, and only
+// the (rare) candidates are re-verified one by one under the key lock.
 func (s *Scheduler) reconcileOrphans(ctx context.Context, rep *reconcileReport) error {
 	cutoff := s.now().Add(-s.cfg.OrphanMinAge)
-	var candidates []string
+	batch := make([]string, 0, reconcileBatch)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		defer func() { batch = batch[:0] }()
+		sizes, err := s.index.Sizes(ctx, batch)
+		if err != nil {
+			return err
+		}
+		var unindexed []string
+		for i, n := range sizes {
+			if n < 0 {
+				unindexed = append(unindexed, batch[i])
+			}
+		}
+		trashed, err := s.index.TrashedAmong(ctx, unindexed)
+		if err != nil {
+			return err
+		}
+		for _, key := range unindexed {
+			if !trashed[key] {
+				s.handleOrphan(ctx, key, rep)
+			}
+		}
+		return nil
+	}
 	err := s.s3.List(ctx, func(key string, _ int64, modified time.Time) error {
 		if ctx.Err() != nil {
 			return errStopList
@@ -164,38 +222,40 @@ func (s *Scheduler) reconcileOrphans(ctx context.Context, rep *reconcileReport) 
 		if modified.After(cutoff) {
 			return nil
 		}
-		if size, err := s.index.Size(ctx, key); err != nil || size >= 0 {
-			return err
+		batch = append(batch, key)
+		if len(batch) == cap(batch) {
+			return flush()
 		}
-		candidates = append(candidates, key)
 		return nil
 	})
 	if err != nil && !errors.Is(err, errStopList) {
 		return err
 	}
+	return flush()
+}
 
-	for _, key := range candidates {
-		if !s.tryLock(key) {
-			continue
-		}
-		size, err := s.index.Size(ctx, key)
-		trashed, terr := s.index.InTrash(ctx, key)
-		if err != nil || terr != nil || size >= 0 || trashed {
-			s.unlock(key)
-			continue
-		}
-		rep.orphans++
-		if s.cfg.ReconcileOrphans == "delete" {
-			if err := s.s3.Delete(ctx, key); err != nil {
-				slog.Warn("reconcile: delete orphan failed", "key", key, "err", err)
-			} else {
-				rep.orphansDeleted++
-				slog.Info("reconcile: deleted orphan object", "key", key)
-			}
-		} else if rep.orphans <= 20 {
-			slog.Warn("reconcile: orphan object in bucket (RECONCILE_ORPHANS=log)", "key", key)
-		}
-		s.unlock(key)
+var errStopList = errors.New("stop listing")
+
+// handleOrphan re-verifies a candidate under its key lock and reports or deletes it.
+func (s *Scheduler) handleOrphan(ctx context.Context, key string, rep *reconcileReport) {
+	if !s.tryLock(key) {
+		return
 	}
-	return nil
+	defer s.unlock(key)
+	size, err := s.index.Size(ctx, key)
+	trashed, terr := s.index.InTrash(ctx, key)
+	if err != nil || terr != nil || size >= 0 || trashed {
+		return
+	}
+	rep.orphans++
+	if s.cfg.ReconcileOrphans == "delete" {
+		if err := s.s3.Delete(ctx, key); err != nil {
+			slog.Warn("reconcile: delete orphan failed", "key", key, "err", err)
+		} else {
+			rep.orphansDeleted++
+			slog.Info("reconcile: deleted orphan object", "key", key)
+		}
+	} else if rep.orphans <= 20 {
+		slog.Warn("reconcile: orphan object in bucket (RECONCILE_ORPHANS=log)", "key", key)
+	}
 }

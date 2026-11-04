@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,12 +21,13 @@ import (
 )
 
 type fakeS3 struct {
-	onPut     func(key string) // test hook, runs after the body was read
-	deleteErr error            // if set, Delete fails
-	mu        sync.Mutex
-	objects   map[string]string
-	modified  map[string]time.Time
-	deletes   []string
+	onPut       func(key string) // test hook, runs after the body was read
+	deleteErr   error            // if set, Delete fails
+	deleteDelay time.Duration    // simulated per-delete latency
+	mu          sync.Mutex
+	objects     map[string]string
+	modified    map[string]time.Time
+	deletes     []string
 }
 
 func (f *fakeS3) Put(_ context.Context, key string, body io.ReaderAt, size int64, _ string) error {
@@ -70,6 +73,7 @@ func (f *fakeS3) putAt(key, body string, at time.Time) {
 }
 
 func (f *fakeS3) Delete(_ context.Context, key string) error {
+	time.Sleep(f.deleteDelay)
 	f.mu.Lock()
 	if f.deleteErr != nil {
 		f.mu.Unlock()
@@ -132,13 +136,34 @@ func (f *fakeStore) markLocal(_ context.Context, key string, _ time.Time) error 
 	return nil
 }
 
-func (f *fakeStore) listS3(context.Context) ([]state.Entry, error) {
+// fakePage is tiny so tests exercise multi-page streaming.
+const fakePage = 3
+
+func (f *fakeStore) forEachS3(_ context.Context, fn func([]state.Entry) error) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []state.Entry
+	var all []state.Entry
 	for k, st := range f.status {
 		if st == StatusS3 {
-			out = append(out, state.Entry{Key: k, Size: f.sizes[k], LastAccess: time.Now().Add(-time.Hour)})
+			all = append(all, state.Entry{Key: k, Size: f.sizes[k], LastAccess: time.Now().Add(-time.Hour)})
+		}
+	}
+	f.mu.Unlock()
+	slices.SortFunc(all, func(a, b state.Entry) int { return strings.Compare(a.Key, b.Key) })
+	for start := 0; start < len(all); start += fakePage {
+		if err := fn(all[start:min(start+fakePage, len(all))]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeStore) filterS3(_ context.Context, keys []string) (map[string]struct{}, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]struct{}{}
+	for _, k := range keys {
+		if f.status[k] == StatusS3 {
+			out[k] = struct{}{}
 		}
 	}
 	return out, nil

@@ -21,7 +21,7 @@ import (
 	"imagelib-s3-dynamic/internal/events"
 )
 
-// --- heat ----------------------------------------------------------------------------
+// --- heat ---
 
 func TestHeatDecaysByHalfLife(t *testing.T) {
 	s := &Scheduler{cfg: config.SchedulerConfig{HalfLife: time.Hour}}
@@ -85,7 +85,7 @@ func TestHeatGCDropsColdEntries(t *testing.T) {
 	}
 }
 
-// --- eligibility ----------------------------------------------------------------------
+// --- eligibility ---
 
 func TestSizeEligibility(t *testing.T) {
 	e := newEnv(t, 50, func(c *config.SchedulerConfig) { c.MinSize = 3; c.MaxSize = 40 })
@@ -126,7 +126,7 @@ func TestMissingLocalFileIsSkipped(t *testing.T) {
 	}
 }
 
-// --- failure handling -----------------------------------------------------------------
+// --- failure handling ---
 
 func TestFileChangedDuringUploadIsRolledBack(t *testing.T) {
 	ctx := context.Background()
@@ -212,7 +212,7 @@ func TestEvictedObjectReMigratedCancelsPendingDelete(t *testing.T) {
 	}
 }
 
-// --- leader election ------------------------------------------------------------------
+// --- leader election ---
 
 func TestElectorStepsDownWhenLockStolen(t *testing.T) {
 	mr := miniredis.RunT(t)
@@ -258,7 +258,7 @@ func TestElectorStepsDownWhenRedisUnreachable(t *testing.T) {
 	}
 }
 
-// --- concurrency stress ---------------------------------------------------------------
+// --- concurrency stress ---
 
 // Random hot keys with a tiny capacity force continuous migrate/evict/delete churn.
 // Invariants checked continuously and at the end:
@@ -366,4 +366,55 @@ func TestStressCapacityInvariantsUnderChurn(t *testing.T) {
 		t.Fatal("expected eviction churn")
 	}
 	t.Logf("max bytes %d/%d, indexed %d objects, %d S3 deletes", maxSeen.Load(), capacity, len(indexed), deletes)
+}
+
+func TestTrashBacklogDrainsConcurrently(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, 1<<30, func(c *config.SchedulerConfig) { c.DeleteDelay = 10 * time.Millisecond })
+	_ = e.sched.ensureIndex(ctx)
+	e.s3.deleteDelay = 20 * time.Millisecond // ~B2 latency; sequential would take 24s
+	past := time.Now().Add(-time.Second)
+	for i := range 1200 {
+		k := fmt.Sprintf("t%04d", i)
+		e.s3.putAt(k, "x", past)
+		_ = e.index.ScheduleDelete(ctx, k, past)
+	}
+	start := time.Now()
+	e.start(t)
+	eventually(t, "backlog drained", func() bool {
+		n, _ := e.rdb.ZCard(ctx, e.index.Keys().Trash).Result()
+		e.s3.mu.Lock()
+		left := len(e.s3.objects)
+		e.s3.mu.Unlock()
+		return n == 0 && left == 0
+	})
+	t.Logf("1200 deletes drained in %s", time.Since(start).Round(time.Millisecond))
+}
+
+func TestOrphanScanAcrossBatches(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, 1<<30, func(c *config.SchedulerConfig) { c.ReconcileOrphans = "delete" })
+	_ = e.sched.ensureIndex(ctx)
+	old := time.Now().Add(-2 * time.Hour)
+	for i := range 2500 { // spans 3 listing batches
+		k := fmt.Sprintf("o%04d", i)
+		e.s3.putAt(k, "x", old)
+		switch {
+		case i%500 == 7: // orphan
+		case i%500 == 9: // evicted, awaiting delete
+			_ = e.index.ScheduleDelete(ctx, k, time.Now().Add(time.Hour))
+		default:
+			e.store.set(k, StatusS3, 1)
+			_, _ = e.index.Add(ctx, k, 1, time.Now())
+		}
+	}
+	if err := e.sched.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2500 {
+		k := fmt.Sprintf("o%04d", i)
+		if want := i%500 != 7; e.s3.has(k) != want {
+			t.Errorf("%s: present=%v, want %v", k, e.s3.has(k), want)
+		}
+	}
 }

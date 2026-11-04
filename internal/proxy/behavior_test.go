@@ -18,7 +18,7 @@ import (
 	"imagelib-s3-dynamic/internal/config"
 )
 
-// --- HTTP semantics of the local tier -------------------------------------------------
+// --- HTTP semantics of the local tier ---
 
 func TestHeadLocalHasHeadersNoBodyNoEvent(t *testing.T) {
 	f := newFixture(t)
@@ -138,7 +138,7 @@ func mustUnescape(t *testing.T, p string) string {
 	return req.URL.Path
 }
 
-// --- S3 tier --------------------------------------------------------------------------
+// --- S3 tier ---
 
 func TestS3ProxyRequestHygiene(t *testing.T) {
 	f := newFixture(t)
@@ -206,7 +206,7 @@ func TestS3ForbiddenFallsBackAndMarksStale(t *testing.T) {
 	}
 }
 
-// --- concurrency stress ---------------------------------------------------------------
+// --- concurrency stress ---
 
 // Every response must be 200 with the exact object bytes while the index flips between
 // tiers, S3 copies disappear and re-appear, and caches go stale underneath.

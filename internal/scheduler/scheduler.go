@@ -116,8 +116,7 @@ func (s *Scheduler) Lead(ctx context.Context) {
 	wg.Wait()
 }
 
-// ---------------------------------------------------------------------------
-// setup
+// --- setup ---
 
 func (s *Scheduler) ensureIndex(ctx context.Context) error {
 	ok, err := s.index.Initialized(ctx)
@@ -134,12 +133,37 @@ func (s *Scheduler) rebuildIndex(ctx context.Context) error {
 	if ok, err := s.index.Initialized(ctx); err != nil || ok {
 		return err // someone (a previous loop iteration) already rebuilt it
 	}
-	entries, err := s.store.listS3(ctx)
+	start := s.now()
+	var objects int
+	err := s.index.RebuildFrom(ctx, func(yield func([]state.Entry) error) error {
+		return s.store.forEachS3(ctx, func(page []state.Entry) error {
+			objects += len(page)
+			return yield(page)
+		})
+	})
 	if err != nil {
 		return err
 	}
-	slog.Info("rebuilding S3 index from postgres", "objects", len(entries))
-	return s.index.Rebuild(ctx, entries)
+	slog.Info("rebuilt S3 index from postgres", "objects", objects, "took", s.now().Sub(start).Round(time.Millisecond))
+	return nil
+}
+
+// recount recomputes the bytes counter from the indexed sizes. It holds indexMu exclusively
+// (all index writers hold it shared), so the incremental scan sees a stable index without
+// a long-running Lua script blocking Redis.
+func (s *Scheduler) recount(ctx context.Context) (before, after int64, err error) {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	if before, err = s.index.TotalBytes(ctx); err != nil {
+		return 0, 0, err
+	}
+	if after, err = s.index.SumSizes(ctx); err != nil {
+		return 0, 0, err
+	}
+	if after != before {
+		err = s.index.SetBytes(ctx, after)
+	}
+	return before, after, err
 }
 
 // indexCheckLoop detects an index lost while we lead (Redis flushed/restarted without
@@ -173,8 +197,7 @@ func (s *Scheduler) ensureGroup(ctx context.Context) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// event consumption & heat
+// --- event consumption & heat ---
 
 func (s *Scheduler) consume(ctx context.Context) {
 	// Take over anything previous leaders read but never acknowledged.
@@ -385,30 +408,9 @@ func (s *Scheduler) heatGCLoop(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		floor := s.cfg.Threshold / 100
-		now := s.now()
-		var cursor uint64
-		removed := 0
-		for ctx.Err() == nil {
-			kv, next, err := s.rdb.HScan(ctx, s.keys.Heat, cursor, "", 1000).Result()
-			if err != nil {
-				slog.Warn("heat gc scan failed", "err", err)
-				break
-			}
-			var dead []string
-			for i := 0; i+1 < len(kv); i += 2 {
-				score, at := decodeHeat(kv[i+1])
-				if s.decay(score, at, now) < floor {
-					dead = append(dead, kv[i])
-				}
-			}
-			if len(dead) > 0 {
-				s.rdb.HDel(ctx, s.keys.Heat, dead...)
-				removed += len(dead)
-			}
-			if cursor = next; cursor == 0 {
-				break
-			}
+		removed, err := s.gcHeat(ctx)
+		if err != nil && ctx.Err() == nil {
+			slog.Warn("heat gc failed", "err", err)
 		}
 		if removed > 0 {
 			slog.Info("heat gc", "removed", removed)
@@ -416,8 +418,39 @@ func (s *Scheduler) heatGCLoop(ctx context.Context) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// key locks
+// gcHeat runs one incremental pass (HSCAN + batched HDEL) over the heat hash and removes
+// entries whose decayed score fell below 1% of the migration threshold.
+func (s *Scheduler) gcHeat(ctx context.Context) (int, error) {
+	floor := s.cfg.Threshold / 100
+	now := s.now()
+	var cursor uint64
+	removed := 0
+	for ctx.Err() == nil {
+		kv, next, err := s.rdb.HScan(ctx, s.keys.Heat, cursor, "", 1000).Result()
+		if err != nil {
+			return removed, err
+		}
+		var dead []string
+		for i := 0; i+1 < len(kv); i += 2 {
+			score, at := decodeHeat(kv[i+1])
+			if s.decay(score, at, now) < floor {
+				dead = append(dead, kv[i])
+			}
+		}
+		if len(dead) > 0 {
+			if err := s.rdb.HDel(ctx, s.keys.Heat, dead...).Err(); err != nil {
+				return removed, err
+			}
+			removed += len(dead)
+		}
+		if cursor = next; cursor == 0 {
+			break
+		}
+	}
+	return removed, ctx.Err()
+}
+
+// --- key locks ---
 
 func (s *Scheduler) tryLock(key string) bool {
 	s.busyMu.Lock()
@@ -435,8 +468,7 @@ func (s *Scheduler) unlock(key string) {
 	s.busyMu.Unlock()
 }
 
-// ---------------------------------------------------------------------------
-// migration
+// --- migration ---
 
 func (s *Scheduler) enqueue(key string, size int64) {
 	s.busyMu.Lock()
@@ -595,8 +627,7 @@ func (s *Scheduler) handleStale(ctx context.Context, key string) {
 	slog.Warn("removed stale s3 index entry", "key", key, "size", freed)
 }
 
-// ---------------------------------------------------------------------------
-// capacity controller (LRU)
+// ---capacity controller (LRU) ---
 
 var errNoSpace = errors.New("no evictable space in s3")
 
@@ -716,6 +747,14 @@ func (s *Scheduler) capacityLoop(ctx context.Context) {
 	}
 }
 
+// trashBatch / trashConcurrency bound one round of S3 deletes. Deletes are network-bound
+// (tens of ms each), so they run in parallel; a full batch is followed immediately by the next
+// so a backlog after mass eviction drains at roughly trashConcurrency / RTT objects per second.
+const (
+	trashBatch       = 500
+	trashConcurrency = 16
+)
+
 // trashLoop deletes de-indexed objects from S3 once their grace period expired.
 func (s *Scheduler) trashLoop(ctx context.Context) {
 	interval := min(max(s.cfg.DeleteDelay/2, 100*time.Millisecond), 5*time.Second)
@@ -727,28 +766,52 @@ func (s *Scheduler) trashLoop(ctx context.Context) {
 			return
 		case <-tick.C:
 		}
-		keys, err := s.index.DueDeletes(ctx, s.now(), 100)
-		if err != nil {
-			slog.Warn("list due deletes failed", "err", err)
-			continue
-		}
-		for _, key := range keys {
-			if !s.tryLock(key) {
-				continue // being re-migrated; it will cancel the delete
+		for ctx.Err() == nil {
+			n, err := s.drainTrash(ctx)
+			if err != nil {
+				slog.Warn("list due deletes failed", "err", err)
+				break
 			}
-			if claimed, err := s.index.CancelDelete(ctx, key); err == nil && claimed {
-				if err := s.s3.Delete(ctx, key); err != nil {
-					slog.Warn("s3 delete failed, retrying later", "key", key, "err", err)
-					_ = s.index.ScheduleDelete(ctx, key, s.now().Add(time.Minute))
-				}
+			if n < trashBatch {
+				break
 			}
-			s.unlock(key)
 		}
 	}
 }
 
-// ---------------------------------------------------------------------------
-// stats
+// drainTrash deletes one batch of due objects and returns how many it processed (keys locked
+// by in-flight work are skipped and not counted, so a busy batch doesn't cause a hot loop).
+func (s *Scheduler) drainTrash(ctx context.Context) (int, error) {
+	keys, err := s.index.DueDeletes(ctx, s.now(), trashBatch)
+	if err != nil || len(keys) == 0 {
+		return 0, err
+	}
+	sem := make(chan struct{}, trashConcurrency)
+	var wg sync.WaitGroup
+	processed := 0
+	for _, key := range keys {
+		if !s.tryLock(key) {
+			continue // being re-migrated; it will cancel the delete
+		}
+		processed++
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem; s.unlock(key) }()
+			claimed, err := s.index.CancelDelete(ctx, key)
+			if err != nil || !claimed {
+				return
+			}
+			if err := s.s3.Delete(ctx, key); err != nil {
+				slog.Warn("s3 delete failed, retrying later", "key", key, "err", err)
+				_ = s.index.ScheduleDelete(ctx, key, s.now().Add(time.Minute))
+			}
+		})
+	}
+	wg.Wait()
+	return processed, nil
+}
+
+// --- stats ---
 
 func (s *Scheduler) statsLoop(ctx context.Context) {
 	tick := time.NewTicker(s.cfg.StatsFlushInterval)

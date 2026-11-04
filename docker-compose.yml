@@ -84,6 +84,10 @@ services:
       - "yes"
       - --maxmemory-policy
       - noeviction
+      # Cap memory so a full Redis rejects writes (migrations fail, serving continues) instead
+      # of being OOM-killed. See README "Sizing". 0 = unlimited.
+      - --maxmemory
+      - ${REDIS_MAXMEMORY:-0}
     volumes:
       - redisdata:/data
     healthcheck:

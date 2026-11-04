@@ -21,7 +21,10 @@ const (
 type Store interface {
 	markS3(ctx context.Context, key, mimeType string, size int64, at time.Time) error
 	markLocal(ctx context.Context, key string, at time.Time) error
-	listS3(ctx context.Context) ([]state.Entry, error)
+	// forEachS3 streams all S3-resident rows in key order, in pages.
+	forEachS3(ctx context.Context, fn func([]state.Entry) error) error
+	// filterS3 returns which of keys have PG status s3.
+	filterS3(ctx context.Context, keys []string) (map[string]struct{}, error)
 	find(ctx context.Context, key string) (*row, error)
 	flushStats(ctx context.Context, rows map[string]*statRow) error
 }
@@ -78,25 +81,54 @@ func (s pgStore) find(ctx context.Context, key string) (*row, error) {
 	return r, nil
 }
 
-func (s pgStore) listS3(ctx context.Context) ([]state.Entry, error) {
-	rows, err := s.gc.Image.Query().Where(query.Image.Status.Equals(StatusS3)).Do(ctx)
+// pageSize bounds memory and statement time when walking millions of S3-resident rows.
+const pageSize = 10000
+
+// forEachS3 streams every S3-resident row in key order, page by page (keyset pagination on
+// the partial index idx_images_s3_key), so memory stays bounded at tens of millions of rows.
+func (s pgStore) forEachS3(ctx context.Context, fn func([]state.Entry) error) error {
+	after := ""
+	for {
+		rows, err := s.gc.RawRows(ctx, `SELECT "key", COALESCE("size", 0) AS size,
+			GREATEST("updated_at", COALESCE("migrated_at", "updated_at"), COALESCE("last_access_at", "updated_at")) AS last
+			FROM "images" WHERE "status" = 's3' AND "key" > $1 ORDER BY "key" LIMIT $2`, after, pageSize)
+		if err != nil {
+			return fmt.Errorf("list s3 rows: %w", err)
+		}
+		if len(rows) == 0 {
+			return nil
+		}
+		page := make([]state.Entry, 0, len(rows))
+		for _, r := range rows {
+			e := state.Entry{Key: fmt.Sprint(r["key"])}
+			e.Size, _ = r["size"].(int64)
+			e.LastAccess, _ = r["last"].(time.Time)
+			page = append(page, e)
+		}
+		if err := fn(page); err != nil {
+			return err
+		}
+		after = page[len(page)-1].Key
+		if len(rows) < pageSize {
+			return nil
+		}
+	}
+}
+
+// filterS3 returns the subset of keys whose PG status is s3.
+func (s pgStore) filterS3(ctx context.Context, keys []string) (map[string]struct{}, error) {
+	out := make(map[string]struct{}, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+	rows, err := s.gc.RawRows(ctx, `SELECT "key" FROM "images" WHERE "key" = ANY($1) AND "status" = 's3'`, keys)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("filter s3 rows: %w", err)
 	}
-	entries := make([]state.Entry, 0, len(rows))
 	for _, r := range rows {
-		e := state.Entry{Key: r.Key, LastAccess: r.UpdatedAt}
-		if r.Size != nil {
-			e.Size = *r.Size
-		}
-		for _, t := range []*time.Time{r.MigratedAt, r.LastAccessAt} {
-			if t != nil && t.After(e.LastAccess) {
-				e.LastAccess = *t
-			}
-		}
-		entries = append(entries, e)
+		out[fmt.Sprint(r["key"])] = struct{}{}
 	}
-	return entries, nil
+	return out, nil
 }
 
 // stats buffers per-key origin hit counters and flushes them in bulk.

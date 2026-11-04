@@ -271,7 +271,8 @@ docker compose --env-file .env.production ps    # imagelib should become "health
 - imagelib listens on `IMAGELIB_BIND` (default `127.0.0.1:8080`); put your CDN or reverse proxy
   in front. PostgreSQL and Redis are not published to the host.
 - PostgreSQL and Redis data live in the `pgdata` and `redisdata` volumes. Redis runs with a
-  password, AOF persistence and `maxmemory-policy noeviction`.
+  password, AOF persistence and `maxmemory-policy noeviction`. Set `REDIS_MAXMEMORY` (see
+  [Sizing](#sizing)) so that a full Redis rejects writes instead of being OOM-killed.
 - The container runs as uid `65532` with a read-only root filesystem and all capabilities
   dropped. **The mounted files must be readable by that uid**: world-readable files (`644`,
   directories `755`) work as-is. Otherwise set `IMAGELIB_UID`/`IMAGELIB_GID` to the owner of the
@@ -300,6 +301,31 @@ includes CA certificates for HTTPS to the bucket.
 ```sh
 go build -o imagelib ./cmd
 ./imagelib            # reads .env from the working directory, if present
+```
+
+### Sizing
+
+Measured with a production-sized dataset (`scripts/scale.sh`):
+
+| Resource | Rule of thumb | Example: 1 TiB budget, 300 KB average, 30M images |
+|---|---|---|
+| S3-resident objects | `S3_CAPACITY` ÷ average object size | ~3.5M |
+| Redis: index | ~170 B per S3-resident object | ~0.6 GB |
+| Redis: heat | ~100 B per object read from local within ~5 × `MIGRATE_HALF_LIFE` | ~0.5 GB at 5M such objects |
+| Redis: `REDIS_MAXMEMORY` / container memory | index + heat + 30% headroom / ≥ 2× maxmemory (AOF rewrite forks) | `2gb` / ≥ 4 GB |
+| PostgreSQL `images` table | ~300 B per image ever read from local (incl. indexes) | ~9 GB at 30M rows |
+| Index rebuild after total Redis loss | ~17 s per million S3-resident objects; requests are served locally meanwhile | ~1 min |
+
+Suggested settings for that example (differences from the defaults):
+
+```ini
+S3_CAPACITY=1TiB              # B2 keeps hidden versions ~1 day after eviction: use ~900GiB for a hard 1 TB budget
+MIGRATE_WORKERS=8
+MIGRATE_HALF_LIFE=2h
+EVICT_MIN_IDLE=1h
+INDEX_CACHE_MAX_KEYS=1000000
+RECONCILE_INTERVAL=24h        # one pass lists the whole bucket (~3,500 list calls for 3.5M objects)
+REDIS_MAXMEMORY=2gb
 ```
 
 ### Topologies
@@ -363,6 +389,11 @@ client with `gco generate`. Destructive changes are refused on startup with a li
 offending changes. Review them, then start once with `DB_PUSH_ALLOW_DESTRUCTIVE=true` or run
 `gco db push --force`.
 
+Upgrading an existing database to the current schema drops the old `url` column and the
+`idx_images_status` index (replaced by the partial index `idx_images_s3_key` on S3-resident
+rows), so it needs one destructive push. On a large `images` table, building the new index
+blocks writes to the table for a short while during startup (tens of seconds at 30M rows).
+
 ## Development
 
 ```sh
@@ -377,6 +408,10 @@ BENCH_REDIS_ADDR=localhost:56379 go test -run '^$' -bench . -benchmem ./internal
 # Load scenarios: local-only, S3 hot set, cache on/off, capacity churn, Redis/S3 outages
 scripts/bench.sh                     # all scenarios (~8 min), results in /tmp/imagelib-bench/results
 C=16 scripts/bench.sh local_only     # selected scenarios with a different concurrency
+
+# Production-scale test of the scheduler's bulk jobs (isolated PG 18 + Redis 7 containers, ~15 min)
+scripts/scale.sh                                            # 30M rows, 3.5M S3 objects, 10M heat entries
+SCALE_PG_ROWS=3000000 SCALE_HEAT=1000000 scripts/scale.sh   # quick run
 ```
 
 The load generator can also be used on its own:
@@ -404,6 +439,7 @@ Measured on an Apple M1 Pro laptop with all components on the same machine.
 | Proxy overhead per 32 KiB S3-tier request | ~19 µs (in-process) |
 | Capacity under churn (48 MiB budget, 309 MiB working set) | Peak usage 98.9% of the budget; never exceeded |
 | Redis paused for 10 s under load | Full fallback to local within ~1 s, 0 errors |
+| Background jobs at production scale (30M images, 3.5M S3 objects ≈ 1 TiB, 10M heat entries) | Index rebuild 58 s, recount 3.6 s, PG↔index reconcile 98 s, orphan scan 4 s, heat GC 16 s. **0 proxy-lookup timeouts**, Go heap < 15 MB, slowest Redis command 7.4 ms |
 
 ## Limitations
 
@@ -440,6 +476,7 @@ internal/
 schema/                .gcorm schema (embedded)
 gen/                   generated GCORM client (do not edit)
 scripts/bench.sh       end-to-end load scenarios
+scripts/scale.sh       production-scale test of rebuild/recount/reconcile/GC/eviction
 Dockerfile             production image (distroless, non-root)
 docker-compose.yml     production stack: imagelib + PostgreSQL + Redis, external bucket
 .env.production.example production configuration template

@@ -2,6 +2,9 @@ package state
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -117,18 +120,133 @@ func TestIndexLostRefusesWrites(t *testing.T) {
 	}
 }
 
-func TestIndexRecount(t *testing.T) {
+func TestIndexRecountPrimitives(t *testing.T) {
 	ctx := context.Background()
 	idx, mr := newTestIndex(t)
 	_, _ = idx.Add(ctx, "a", 10, time.Now())
 	_, _ = idx.Add(ctx, "b", 5, time.Now())
 	_ = mr.Set("t:s3:bytes", "999") // drift
 
-	before, after, err := idx.Recount(ctx)
-	if err != nil || before != 999 || after != 15 {
-		t.Fatalf("recount = %d → %d, %v", before, after, err)
+	sum, err := idx.SumSizes(ctx)
+	if err != nil || sum != 15 {
+		t.Fatalf("sum = %d, %v", sum, err)
+	}
+	if err := idx.SetBytes(ctx, sum); err != nil {
+		t.Fatal(err)
 	}
 	if total, _ := idx.TotalBytes(ctx); total != 15 {
 		t.Fatalf("total = %d", total)
+	}
+	mr.Del("t:s3:epoch")
+	if err := idx.SetBytes(ctx, 1); err != ErrNotInitialized {
+		t.Fatalf("SetBytes on lost index: %v", err)
+	}
+}
+
+func TestRebuildFromPagesSwapsAtomically(t *testing.T) {
+	ctx := context.Background()
+	idx, mr := newTestIndex(t)
+	_, _ = idx.Add(ctx, "old", 999, time.Now())
+
+	now := time.Now()
+	pages := [][]Entry{}
+	for p := range 5 { // 5 pages × 2500 entries: crosses the internal 1000-entry command batches
+		var page []Entry
+		for i := range 2500 {
+			page = append(page, Entry{Key: fmt.Sprintf("k%d-%d", p, i), Size: 2, LastAccess: now.Add(time.Duration(i) * time.Millisecond)})
+		}
+		pages = append(pages, page)
+	}
+	calls := 0
+	err := idx.RebuildFrom(ctx, func(yield func([]Entry) error) error {
+		for _, p := range pages {
+			calls++
+			if calls == 3 {
+				// Mid-rebuild, readers still see the previous index.
+				if ok, _ := idx.Contains(ctx, "old"); !ok {
+					t.Error("old index must stay visible until the swap")
+				}
+			}
+			if err := yield(p); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := idx.Contains(ctx, "old"); ok {
+		t.Fatal("old entries must be gone after the swap")
+	}
+	if total, _ := idx.TotalBytes(ctx); total != 5*2500*2 {
+		t.Fatalf("total = %d", total)
+	}
+	if m, _ := mr.ZMembers("t:s3:lru"); len(m) != 12500 {
+		t.Fatalf("lru size = %d", len(m))
+	}
+	for _, k := range mr.Keys() {
+		if strings.HasSuffix(k, ":rebuild") {
+			t.Fatalf("temporary key %s left behind", k)
+		}
+	}
+
+	// Empty source → empty but initialized index.
+	if err := idx.RebuildFrom(ctx, func(func([]Entry) error) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := idx.Initialized(ctx); !ok {
+		t.Fatal("empty rebuild must still initialize the index")
+	}
+	if total, _ := idx.TotalBytes(ctx); total != 0 {
+		t.Fatalf("total = %d", total)
+	}
+
+	// A failing source leaves the previous index untouched.
+	_, _ = idx.Add(ctx, "keep", 1, now)
+	boom := errors.New("pg down")
+	if err := idx.RebuildFrom(ctx, func(yield func([]Entry) error) error {
+		_ = yield([]Entry{{Key: "partial", Size: 1}})
+		return boom
+	}); err != boom {
+		t.Fatalf("err = %v", err)
+	}
+	if ok, _ := idx.Contains(ctx, "keep"); !ok {
+		t.Fatal("failed rebuild must not replace the index")
+	}
+	if ok, _ := idx.Contains(ctx, "partial"); ok {
+		t.Fatal("failed rebuild must not leak partial data")
+	}
+}
+
+func TestBatchLookups(t *testing.T) {
+	ctx := context.Background()
+	idx, _ := newTestIndex(t)
+	_, _ = idx.Add(ctx, "a", 7, time.Now())
+	_ = idx.ScheduleDelete(ctx, "t1", time.Now())
+
+	sizes, err := idx.Sizes(ctx, []string{"a", "missing"})
+	if err != nil || sizes[0] != 7 || sizes[1] != -1 {
+		t.Fatalf("sizes = %v, %v", sizes, err)
+	}
+	trashed, err := idx.TrashedAmong(ctx, []string{"t1", "a", "nope"})
+	if err != nil || !trashed["t1"] || trashed["a"] || trashed["nope"] {
+		t.Fatalf("trashed = %v, %v", trashed, err)
+	}
+
+	for i := range 2500 {
+		_, _ = idx.Add(ctx, fmt.Sprintf("s%d", i), 1, time.Now())
+	}
+	seen := map[string]bool{}
+	if err := idx.ScanKeys(ctx, func(keys []string) error {
+		for _, k := range keys {
+			seen[k] = true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2501 {
+		t.Fatalf("scanned %d keys, want 2501", len(seen))
 	}
 }
