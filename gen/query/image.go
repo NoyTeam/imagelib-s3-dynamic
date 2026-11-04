@@ -30,33 +30,42 @@ func ApplyImageOptions(opts []ImageQueryOption) ImageQueryConfig {
 
 // ImageQuery is the namespace for Image query operations.
 type ImageQuery struct {
-	Id        imageIdField
-	Key       imageKeyField
-	Url       imageUrlField
-	Size      imageSizeField
-	MimeType  imageMimeTypeField
-	CreatedAt imageCreatedAtField
-	UpdatedAt imageUpdatedAtField
+	Id           imageIdField
+	Key          imageKeyField
+	Size         imageSizeField
+	MimeType     imageMimeTypeField
+	Status       imageStatusField
+	Hits         imageHitsField
+	LastAccessAt imageLastAccessAtField
+	MigratedAt   imageMigratedAtField
+	CreatedAt    imageCreatedAtField
+	UpdatedAt    imageUpdatedAtField
 }
 
 const ImageTable = "images"
 const ImageIdColumn = "id"
 const ImageKeyColumn = "key"
-const ImageUrlColumn = "url"
 const ImageSizeColumn = "size"
 const ImageMimeTypeColumn = "mime_type"
+const ImageStatusColumn = "status"
+const ImageHitsColumn = "hits"
+const ImageLastAccessAtColumn = "last_access_at"
+const ImageMigratedAtColumn = "migrated_at"
 const ImageCreatedAtColumn = "created_at"
 const ImageUpdatedAtColumn = "updated_at"
 
 // ImageQuery provides query building methods for the Image model.
 var Image = ImageQuery{
-	Id:        imageIdField{},
-	Key:       imageKeyField{},
-	Url:       imageUrlField{},
-	Size:      imageSizeField{},
-	MimeType:  imageMimeTypeField{},
-	CreatedAt: imageCreatedAtField{},
-	UpdatedAt: imageUpdatedAtField{},
+	Id:           imageIdField{},
+	Key:          imageKeyField{},
+	Size:         imageSizeField{},
+	MimeType:     imageMimeTypeField{},
+	Status:       imageStatusField{},
+	Hits:         imageHitsField{},
+	LastAccessAt: imageLastAccessAtField{},
+	MigratedAt:   imageMigratedAtField{},
+	CreatedAt:    imageCreatedAtField{},
+	UpdatedAt:    imageUpdatedAtField{},
 }
 
 // ImageWhereClause represents a WHERE condition for Image.
@@ -270,92 +279,21 @@ func (imageKeyField) Desc() ImageOrderByClause {
 	return ImageOrderByClause{Field: "key", Direction: "DESC"}
 }
 
-// UrlField provides query operations for the url field.
-type imageUrlField struct{}
-
-// Equals creates an equality condition.
-func (imageUrlField) Equals(v *string) ImageWhereClause {
-	return ImageWhereClause{Field: "url", Operator: "=", Value: v}
-}
-
-// Not creates a not-equal condition.
-func (imageUrlField) Not(v *string) ImageWhereClause {
-	return ImageWhereClause{Field: "url", Operator: "!=", Value: v}
-}
-
-// In creates an IN condition.
-func (imageUrlField) In(vals ...*string) ImageWhereClause {
-	iVals := make([]any, len(vals))
-	for i, v := range vals {
-		iVals[i] = v
-	}
-	return ImageWhereClause{Field: "url", Operator: "IN", Value: iVals}
-}
-
-// NotIn creates a NOT IN condition.
-func (imageUrlField) NotIn(vals ...*string) ImageWhereClause {
-	iVals := make([]any, len(vals))
-	for i, v := range vals {
-		iVals[i] = v
-	}
-	return ImageWhereClause{Field: "url", Operator: "NOT IN", Value: iVals}
-}
-
-// Contains creates a LIKE '%v%' condition.
-func (imageUrlField) Contains(v string) ImageWhereClause {
-	return ImageWhereClause{Field: "url", Operator: "CONTAINS", Value: v}
-}
-
-// StartsWith creates a LIKE 'v%' condition.
-func (imageUrlField) StartsWith(v string) ImageWhereClause {
-	return ImageWhereClause{Field: "url", Operator: "STARTS_WITH", Value: v}
-}
-
-// EndsWith creates a LIKE '%v' condition.
-func (imageUrlField) EndsWith(v string) ImageWhereClause {
-	return ImageWhereClause{Field: "url", Operator: "ENDS_WITH", Value: v}
-}
-
-// IsNull creates an IS NULL condition.
-func (imageUrlField) IsNull() ImageWhereClause {
-	return ImageWhereClause{Field: "url", Operator: "IS NULL", Value: nil}
-}
-
-// Set creates a set operation for create/update.
-func (imageUrlField) Set(v string) ImageSetClause {
-	return ImageSetClause{Field: "url", Value: v}
-}
-
-// SetNull sets the field to NULL.
-func (imageUrlField) SetNull() ImageSetClause {
-	return ImageSetClause{Field: "url", Value: nil}
-}
-
-// Asc returns an ascending order clause for this field.
-func (imageUrlField) Asc() ImageOrderByClause {
-	return ImageOrderByClause{Field: "url", Direction: "ASC"}
-}
-
-// Desc returns a descending order clause for this field.
-func (imageUrlField) Desc() ImageOrderByClause {
-	return ImageOrderByClause{Field: "url", Direction: "DESC"}
-}
-
 // SizeField provides query operations for the size field.
 type imageSizeField struct{}
 
 // Equals creates an equality condition.
-func (imageSizeField) Equals(v *int) ImageWhereClause {
+func (imageSizeField) Equals(v *int64) ImageWhereClause {
 	return ImageWhereClause{Field: "size", Operator: "=", Value: v}
 }
 
 // Not creates a not-equal condition.
-func (imageSizeField) Not(v *int) ImageWhereClause {
+func (imageSizeField) Not(v *int64) ImageWhereClause {
 	return ImageWhereClause{Field: "size", Operator: "!=", Value: v}
 }
 
 // In creates an IN condition.
-func (imageSizeField) In(vals ...*int) ImageWhereClause {
+func (imageSizeField) In(vals ...*int64) ImageWhereClause {
 	iVals := make([]any, len(vals))
 	for i, v := range vals {
 		iVals[i] = v
@@ -364,7 +302,7 @@ func (imageSizeField) In(vals ...*int) ImageWhereClause {
 }
 
 // NotIn creates a NOT IN condition.
-func (imageSizeField) NotIn(vals ...*int) ImageWhereClause {
+func (imageSizeField) NotIn(vals ...*int64) ImageWhereClause {
 	iVals := make([]any, len(vals))
 	for i, v := range vals {
 		iVals[i] = v
@@ -373,22 +311,22 @@ func (imageSizeField) NotIn(vals ...*int) ImageWhereClause {
 }
 
 // Lt creates a less-than condition.
-func (imageSizeField) Lt(v *int) ImageWhereClause {
+func (imageSizeField) Lt(v *int64) ImageWhereClause {
 	return ImageWhereClause{Field: "size", Operator: "<", Value: v}
 }
 
 // Lte creates a less-than-or-equal condition.
-func (imageSizeField) Lte(v *int) ImageWhereClause {
+func (imageSizeField) Lte(v *int64) ImageWhereClause {
 	return ImageWhereClause{Field: "size", Operator: "<=", Value: v}
 }
 
 // Gt creates a greater-than condition.
-func (imageSizeField) Gt(v *int) ImageWhereClause {
+func (imageSizeField) Gt(v *int64) ImageWhereClause {
 	return ImageWhereClause{Field: "size", Operator: ">", Value: v}
 }
 
 // Gte creates a greater-than-or-equal condition.
-func (imageSizeField) Gte(v *int) ImageWhereClause {
+func (imageSizeField) Gte(v *int64) ImageWhereClause {
 	return ImageWhereClause{Field: "size", Operator: ">=", Value: v}
 }
 
@@ -398,7 +336,7 @@ func (imageSizeField) IsNull() ImageWhereClause {
 }
 
 // Set creates a set operation for create/update.
-func (imageSizeField) Set(v int) ImageSetClause {
+func (imageSizeField) Set(v int64) ImageSetClause {
 	return ImageSetClause{Field: "size", Value: v}
 }
 
@@ -486,6 +424,285 @@ func (imageMimeTypeField) Asc() ImageOrderByClause {
 // Desc returns a descending order clause for this field.
 func (imageMimeTypeField) Desc() ImageOrderByClause {
 	return ImageOrderByClause{Field: "mime_type", Direction: "DESC"}
+}
+
+// StatusField provides query operations for the status field.
+type imageStatusField struct{}
+
+// Equals creates an equality condition.
+func (imageStatusField) Equals(v string) ImageWhereClause {
+	return ImageWhereClause{Field: "status", Operator: "=", Value: v}
+}
+
+// Not creates a not-equal condition.
+func (imageStatusField) Not(v string) ImageWhereClause {
+	return ImageWhereClause{Field: "status", Operator: "!=", Value: v}
+}
+
+// In creates an IN condition.
+func (imageStatusField) In(vals ...string) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "status", Operator: "IN", Value: iVals}
+}
+
+// NotIn creates a NOT IN condition.
+func (imageStatusField) NotIn(vals ...string) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "status", Operator: "NOT IN", Value: iVals}
+}
+
+// Contains creates a LIKE '%v%' condition.
+func (imageStatusField) Contains(v string) ImageWhereClause {
+	return ImageWhereClause{Field: "status", Operator: "CONTAINS", Value: v}
+}
+
+// StartsWith creates a LIKE 'v%' condition.
+func (imageStatusField) StartsWith(v string) ImageWhereClause {
+	return ImageWhereClause{Field: "status", Operator: "STARTS_WITH", Value: v}
+}
+
+// EndsWith creates a LIKE '%v' condition.
+func (imageStatusField) EndsWith(v string) ImageWhereClause {
+	return ImageWhereClause{Field: "status", Operator: "ENDS_WITH", Value: v}
+}
+
+// Set creates a set operation for create/update.
+func (imageStatusField) Set(v string) ImageSetClause {
+	return ImageSetClause{Field: "status", Value: v}
+}
+
+// Asc returns an ascending order clause for this field.
+func (imageStatusField) Asc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "status", Direction: "ASC"}
+}
+
+// Desc returns a descending order clause for this field.
+func (imageStatusField) Desc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "status", Direction: "DESC"}
+}
+
+// HitsField provides query operations for the hits field.
+type imageHitsField struct{}
+
+// Equals creates an equality condition.
+func (imageHitsField) Equals(v int64) ImageWhereClause {
+	return ImageWhereClause{Field: "hits", Operator: "=", Value: v}
+}
+
+// Not creates a not-equal condition.
+func (imageHitsField) Not(v int64) ImageWhereClause {
+	return ImageWhereClause{Field: "hits", Operator: "!=", Value: v}
+}
+
+// In creates an IN condition.
+func (imageHitsField) In(vals ...int64) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "hits", Operator: "IN", Value: iVals}
+}
+
+// NotIn creates a NOT IN condition.
+func (imageHitsField) NotIn(vals ...int64) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "hits", Operator: "NOT IN", Value: iVals}
+}
+
+// Lt creates a less-than condition.
+func (imageHitsField) Lt(v int64) ImageWhereClause {
+	return ImageWhereClause{Field: "hits", Operator: "<", Value: v}
+}
+
+// Lte creates a less-than-or-equal condition.
+func (imageHitsField) Lte(v int64) ImageWhereClause {
+	return ImageWhereClause{Field: "hits", Operator: "<=", Value: v}
+}
+
+// Gt creates a greater-than condition.
+func (imageHitsField) Gt(v int64) ImageWhereClause {
+	return ImageWhereClause{Field: "hits", Operator: ">", Value: v}
+}
+
+// Gte creates a greater-than-or-equal condition.
+func (imageHitsField) Gte(v int64) ImageWhereClause {
+	return ImageWhereClause{Field: "hits", Operator: ">=", Value: v}
+}
+
+// Set creates a set operation for create/update.
+func (imageHitsField) Set(v int64) ImageSetClause {
+	return ImageSetClause{Field: "hits", Value: v}
+}
+
+// Asc returns an ascending order clause for this field.
+func (imageHitsField) Asc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "hits", Direction: "ASC"}
+}
+
+// Desc returns a descending order clause for this field.
+func (imageHitsField) Desc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "hits", Direction: "DESC"}
+}
+
+// LastAccessAtField provides query operations for the lastAccessAt field.
+type imageLastAccessAtField struct{}
+
+// Equals creates an equality condition.
+func (imageLastAccessAtField) Equals(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: "=", Value: v}
+}
+
+// Not creates a not-equal condition.
+func (imageLastAccessAtField) Not(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: "!=", Value: v}
+}
+
+// In creates an IN condition.
+func (imageLastAccessAtField) In(vals ...*time.Time) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "last_access_at", Operator: "IN", Value: iVals}
+}
+
+// NotIn creates a NOT IN condition.
+func (imageLastAccessAtField) NotIn(vals ...*time.Time) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "last_access_at", Operator: "NOT IN", Value: iVals}
+}
+
+// Lt creates a less-than condition.
+func (imageLastAccessAtField) Lt(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: "<", Value: v}
+}
+
+// Lte creates a less-than-or-equal condition.
+func (imageLastAccessAtField) Lte(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: "<=", Value: v}
+}
+
+// Gt creates a greater-than condition.
+func (imageLastAccessAtField) Gt(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: ">", Value: v}
+}
+
+// Gte creates a greater-than-or-equal condition.
+func (imageLastAccessAtField) Gte(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: ">=", Value: v}
+}
+
+// IsNull creates an IS NULL condition.
+func (imageLastAccessAtField) IsNull() ImageWhereClause {
+	return ImageWhereClause{Field: "last_access_at", Operator: "IS NULL", Value: nil}
+}
+
+// Set creates a set operation for create/update.
+func (imageLastAccessAtField) Set(v time.Time) ImageSetClause {
+	return ImageSetClause{Field: "last_access_at", Value: v}
+}
+
+// SetNull sets the field to NULL.
+func (imageLastAccessAtField) SetNull() ImageSetClause {
+	return ImageSetClause{Field: "last_access_at", Value: nil}
+}
+
+// Asc returns an ascending order clause for this field.
+func (imageLastAccessAtField) Asc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "last_access_at", Direction: "ASC"}
+}
+
+// Desc returns a descending order clause for this field.
+func (imageLastAccessAtField) Desc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "last_access_at", Direction: "DESC"}
+}
+
+// MigratedAtField provides query operations for the migratedAt field.
+type imageMigratedAtField struct{}
+
+// Equals creates an equality condition.
+func (imageMigratedAtField) Equals(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: "=", Value: v}
+}
+
+// Not creates a not-equal condition.
+func (imageMigratedAtField) Not(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: "!=", Value: v}
+}
+
+// In creates an IN condition.
+func (imageMigratedAtField) In(vals ...*time.Time) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "migrated_at", Operator: "IN", Value: iVals}
+}
+
+// NotIn creates a NOT IN condition.
+func (imageMigratedAtField) NotIn(vals ...*time.Time) ImageWhereClause {
+	iVals := make([]any, len(vals))
+	for i, v := range vals {
+		iVals[i] = v
+	}
+	return ImageWhereClause{Field: "migrated_at", Operator: "NOT IN", Value: iVals}
+}
+
+// Lt creates a less-than condition.
+func (imageMigratedAtField) Lt(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: "<", Value: v}
+}
+
+// Lte creates a less-than-or-equal condition.
+func (imageMigratedAtField) Lte(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: "<=", Value: v}
+}
+
+// Gt creates a greater-than condition.
+func (imageMigratedAtField) Gt(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: ">", Value: v}
+}
+
+// Gte creates a greater-than-or-equal condition.
+func (imageMigratedAtField) Gte(v *time.Time) ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: ">=", Value: v}
+}
+
+// IsNull creates an IS NULL condition.
+func (imageMigratedAtField) IsNull() ImageWhereClause {
+	return ImageWhereClause{Field: "migrated_at", Operator: "IS NULL", Value: nil}
+}
+
+// Set creates a set operation for create/update.
+func (imageMigratedAtField) Set(v time.Time) ImageSetClause {
+	return ImageSetClause{Field: "migrated_at", Value: v}
+}
+
+// SetNull sets the field to NULL.
+func (imageMigratedAtField) SetNull() ImageSetClause {
+	return ImageSetClause{Field: "migrated_at", Value: nil}
+}
+
+// Asc returns an ascending order clause for this field.
+func (imageMigratedAtField) Asc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "migrated_at", Direction: "ASC"}
+}
+
+// Desc returns a descending order clause for this field.
+func (imageMigratedAtField) Desc() ImageOrderByClause {
+	return ImageOrderByClause{Field: "migrated_at", Direction: "DESC"}
 }
 
 // CreatedAtField provides query operations for the createdAt field.
@@ -653,18 +870,21 @@ type ImageGroupByResult struct {
 
 // ImageCreateInput holds data for creating a Image record.
 type ImageCreateInput struct {
-	Id        string
-	Key       string
-	Url       *string
-	Size      *int
-	MimeType  *string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	Id           string
+	Key          string
+	Size         *int64
+	MimeType     *string
+	Status       string
+	Hits         int64
+	LastAccessAt *time.Time
+	MigratedAt   *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // ScalarValues returns the scalar field values in column order.
 func (d ImageCreateInput) ScalarValues() []any {
-	return []any{d.Id, d.Key, d.Url, d.Size, d.MimeType, d.CreatedAt, d.UpdatedAt}
+	return []any{d.Id, d.Key, d.Size, d.MimeType, d.Status, d.Hits, d.LastAccessAt, d.MigratedAt, d.CreatedAt, d.UpdatedAt}
 }
 
 // ImageCreateNestedInput supports nested creates and connects.

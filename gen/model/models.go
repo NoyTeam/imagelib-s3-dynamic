@@ -7,11 +7,14 @@ import (
 
 // Image represents the Image model.
 type Image struct {
-	Id        string    `db:"id" json:"id"`
-	Key       string    `db:"key" json:"key"`
-	Url       *string   `db:"url" json:"url"`
-	Size      *int      `db:"size" json:"size"`
-	MimeType  *string   `db:"mime_type" json:"mimeType"`
-	CreatedAt time.Time `db:"created_at" json:"createdAt"`
-	UpdatedAt time.Time `db:"updated_at" json:"updatedAt"`
+	Id           string     `db:"id" json:"id"`
+	Key          string     `db:"key" json:"key"`
+	Size         *int64     `db:"size" json:"size"`
+	MimeType     *string    `db:"mime_type" json:"mimeType"`
+	Status       string     `db:"status" json:"status"`
+	Hits         int64      `db:"hits" json:"hits"`
+	LastAccessAt *time.Time `db:"last_access_at" json:"lastAccessAt"`
+	MigratedAt   *time.Time `db:"migrated_at" json:"migratedAt"`
+	CreatedAt    time.Time  `db:"created_at" json:"createdAt"`
+	UpdatedAt    time.Time  `db:"updated_at" json:"updatedAt"`
 }

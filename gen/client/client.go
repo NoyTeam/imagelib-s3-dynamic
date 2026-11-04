@@ -220,7 +220,7 @@ func (c *Client) Tx(ctx context.Context, fn func(tx *Client) error) error {
 
 func quotedImageTable(c *Client) string { return c.quoteIdentifier("images") }
 func quotedImageColumns(c *Client) string {
-	cols := []string{"id", "key", "url", "size", "mime_type", "created_at", "updated_at"}
+	cols := []string{"id", "key", "size", "mime_type", "status", "hits", "last_access_at", "migrated_at", "created_at", "updated_at"}
 	for i := range cols {
 		cols[i] = c.quoteIdentifier(cols[i])
 	}
@@ -233,11 +233,17 @@ func quoteImageField(c *Client, field string) (string, error) {
 		return c.quoteIdentifier(field), nil
 	case "key":
 		return c.quoteIdentifier(field), nil
-	case "url":
-		return c.quoteIdentifier(field), nil
 	case "size":
 		return c.quoteIdentifier(field), nil
 	case "mime_type":
+		return c.quoteIdentifier(field), nil
+	case "status":
+		return c.quoteIdentifier(field), nil
+	case "hits":
+		return c.quoteIdentifier(field), nil
+	case "last_access_at":
+		return c.quoteIdentifier(field), nil
+	case "migrated_at":
 		return c.quoteIdentifier(field), nil
 	case "created_at":
 		return c.quoteIdentifier(field), nil
@@ -452,14 +458,14 @@ func (b ImageCreateManyBuilder) DoReturning(ctx context.Context) ([]model.Image,
 		if end > len(b.data) {
 			end = len(b.data)
 		}
-		q, args := b.action.buildImageCreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, []string{"id", "key", "url", "size", "mime_type", "created_at", "updated_at"})
+		q, args := b.action.buildImageCreateManySQL(b.data[start:end], b.conflictDoNothing, b.conflictColumns, []string{"id", "key", "size", "mime_type", "status", "hits", "last_access_at", "migrated_at", "created_at", "updated_at"})
 		rows, err := b.action.client.executor.QueryContext(ctx, q, args...)
 		if err != nil {
 			return nil, fmt.Errorf("Image.BulkCreate.DoReturning: %w", err)
 		}
 		for rows.Next() {
 			var item model.Image
-			if err := rows.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+			if err := rows.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 				_ = rows.Close()
 				return nil, fmt.Errorf("Image.BulkCreate.DoReturning scan: %w", err)
 			}
@@ -486,7 +492,7 @@ func (b ImageCreateManyBuilder) DoReturningValues(ctx context.Context) ([]map[st
 	}
 	returningColumns := b.returningColumns
 	if len(returningColumns) == 0 {
-		returningColumns = []string{"id", "key", "url", "size", "mime_type", "created_at", "updated_at"}
+		returningColumns = []string{"id", "key", "size", "mime_type", "status", "hits", "last_access_at", "migrated_at", "created_at", "updated_at"}
 	}
 	batchSize := b.batchSize
 	if batchSize <= 0 || batchSize > len(b.data) {
@@ -738,7 +744,7 @@ func (a ImageActions) FindMany(ctx context.Context, opts ...query.ImageQueryOpti
 	var results []model.Image
 	for rows.Next() {
 		var item model.Image
-		if err := rows.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := rows.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("Image.FindMany scan: %w", err)
 		}
 		results = append(results, item)
@@ -770,7 +776,7 @@ func (a ImageActions) FindUnique(ctx context.Context, where query.ImageWhereClau
 	q += " LIMIT 1"
 	row := a.client.executor.QueryRowContext(ctx, q, args...)
 	var item model.Image
-	if err := row.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+	if err := row.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -801,7 +807,7 @@ func (a ImageActions) CreateOne(ctx context.Context, sets ...query.ImageSetClaus
 		q += " RETURNING " + quotedImageColumns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, vals...)
 		var item model.Image
-		if err := row.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := row.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("Image.CreateOne: %w", err)
 		}
 		return &item, nil
@@ -820,7 +826,7 @@ func (a ImageActions) CreateMany(ctx context.Context, data []query.ImageCreateIn
 }
 
 func (a ImageActions) buildImageCreateManySQL(data []query.ImageCreateInput, conflictDoNothing bool, conflictColumns []string, returningColumns []string) (string, []any) {
-	cols := []string{"id", "key", "url", "size", "mime_type", "created_at", "updated_at"}
+	cols := []string{"id", "key", "size", "mime_type", "status", "hits", "last_access_at", "migrated_at", "created_at", "updated_at"}
 	for i := range cols {
 		cols[i] = a.client.quoteIdentifier(cols[i])
 	}
@@ -893,7 +899,7 @@ func (a ImageActions) UpdateOne(ctx context.Context, where query.ImageWhereClaus
 		q += " RETURNING " + quotedImageColumns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.Image
-		if err := row.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := row.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			if err == sql.ErrNoRows {
 				return nil, nil
 			}
@@ -998,7 +1004,7 @@ func (a ImageActions) UpsertOne(ctx context.Context, where query.ImageWhereClaus
 		q += " RETURNING " + quotedImageColumns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.Image
-		if err := row.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := row.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			return nil, fmt.Errorf("Image.UpsertOne: %w", err)
 		}
 		return &item, nil
@@ -1022,7 +1028,7 @@ func (a ImageActions) DeleteOne(ctx context.Context, where query.ImageWhereClaus
 		q += " RETURNING " + quotedImageColumns(a.client)
 		row := a.client.executor.QueryRowContext(ctx, q, args...)
 		var item model.Image
-		if err := row.Scan(&item.Id, &item.Key, &item.Url, &item.Size, &item.MimeType, &item.CreatedAt, &item.UpdatedAt); err != nil {
+		if err := row.Scan(&item.Id, &item.Key, &item.Size, &item.MimeType, &item.Status, &item.Hits, &item.LastAccessAt, &item.MigratedAt, &item.CreatedAt, &item.UpdatedAt); err != nil {
 			if err == sql.ErrNoRows {
 				return nil, nil
 			}

@@ -10,13 +10,17 @@ generator client {
 }
 
 model Image {
-  id        String   @id @default(uuid())
-  key       String   @unique
-  url       String?
-  size      Int?
-  mimeType  String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id           String    @id @default(uuid())
+  key          String    @unique
+  size         BigInt?
+  mimeType     String?
+  status       String    @default("local") // local | s3
+  hits         BigInt    @default(0) // total observed local misses (origin reads)
+  lastAccessAt DateTime?
+  migratedAt   DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
+  @@index([status])
   @@map("images")
 }

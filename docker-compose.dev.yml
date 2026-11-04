@@ -1,0 +1,57 @@
+# Local development / integration-test dependencies:
+# PostgreSQL, Redis and pgsty/silo (S3-compatible MinIO fork) with a public-read bucket.
+#
+#   docker compose -f docker-compose.dev.yml up -d --wait
+#   go test -tags integration -count=1 ./internal/app/
+#
+# To run the binary against it, point .env at:
+#   DATABASE_URL=postgres://postgres:postgres@localhost:55432/imagelib?sslmode=disable
+#   REDIS_ADDR=localhost:56379
+#   S3_ENDPOINT=http://localhost:59000  S3_REGION=us-east-1  S3_BUCKET=images  S3_FORCE_PATH_STYLE=true
+#   S3_PUBLIC_URL=http://localhost:59000/images
+#   B2_APPLICATION_KEY_ID=siloadmin  B2_APPLICATION_KEY=siloadmin-secret
+name: imagelib-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: imagelib
+    ports: ["55432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    ports: ["56379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      retries: 30
+
+  # Starts the server, then creates the bucket with anonymous download (the proxy reads
+  # S3_PUBLIC_URL). Healthy only once the bucket is ready, so `up --wait` is reliable.
+  silo:
+    image: pgsty/silo:latest
+    environment:
+      MINIO_ROOT_USER: siloadmin
+      MINIO_ROOT_PASSWORD: siloadmin-secret
+    ports: ["59000:9000", "59001:9001"]
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        rm -f /tmp/ready
+        silo server /data --console-address :9001 &
+        until curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1; do sleep 0.5; done
+        mcli alias set local http://127.0.0.1:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" &&
+        mcli mb -p local/images &&
+        mcli anonymous set download local/images &&
+        touch /tmp/ready
+        wait
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      retries: 60

@@ -146,9 +146,12 @@ query.PostAuthorIdColumn
 - Fields:
   - `Id` (String, id)
   - `Key` (String, unique)
-  - `Url` (String, optional)
-  - `Size` (Int, optional)
+  - `Size` (BigInt, optional)
   - `Mimetype` (String, optional)
+  - `Status` (String)
+  - `Hits` (BigInt)
+  - `Lastaccessat` (DateTime, optional)
+  - `Migratedat` (DateTime, optional)
   - `Createdat` (DateTime)
   - `Updatedat` (DateTime)
 
