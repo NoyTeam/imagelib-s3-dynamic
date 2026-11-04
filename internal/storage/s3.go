@@ -47,9 +47,8 @@ func (n ObjectNamer) PublicURL(key string) string {
 // S3 uploads and deletes objects in the hot tier bucket.
 type S3 struct {
 	ObjectNamer
-	client       *s3.Client
-	bucket       string
-	cacheControl string
+	client *s3.Client
+	bucket string
 }
 
 func NewS3(cfg config.StorageConfig) *S3 {
@@ -64,10 +63,9 @@ func NewS3(cfg config.StorageConfig) *S3 {
 		ResponseChecksumValidation: aws.ResponseChecksumValidationWhenRequired,
 	})
 	return &S3{
-		ObjectNamer:  NewObjectNamer(cfg),
-		client:       client,
-		bucket:       cfg.Bucket,
-		cacheControl: cfg.CacheControl,
+		ObjectNamer: NewObjectNamer(cfg),
+		client:      client,
+		bucket:      cfg.Bucket,
 	}
 }
 
@@ -79,9 +77,6 @@ func (s *S3) Put(ctx context.Context, key string, body io.ReaderAt, size int64, 
 		Body:          io.NewSectionReader(body, 0, size),
 		ContentLength: aws.Int64(size),
 		ContentType:   aws.String(contentType),
-	}
-	if s.cacheControl != "" {
-		in.CacheControl = aws.String(s.cacheControl)
 	}
 	if _, err := s.client.PutObject(ctx, in); err != nil {
 		return fmt.Errorf("s3 put %s: %w", key, err)

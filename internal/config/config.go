@@ -54,7 +54,6 @@ type StorageConfig struct {
 	Prefix         string // Option
 	PublicURL      string
 	ForcePathStyle bool
-	CacheControl   string // Cache-Control stored on uploaded objects
 }
 
 type ProxyConfig struct {
@@ -110,7 +109,6 @@ func Load() (Config, error) {
 			Prefix:         strings.Trim(os.Getenv("S3_PREFIX"), "/"),
 			PublicURL:      strings.TrimRight(os.Getenv("S3_PUBLIC_URL"), "/"),
 			ForcePathStyle: p.bool("S3_FORCE_PATH_STYLE", false),
-			CacheControl:   getEnv("S3_CACHE_CONTROL", "public, max-age=31536000"),
 		},
 		Proxy: ProxyConfig{
 			EventBuffer:     p.int("EVENT_BUFFER", 8192),

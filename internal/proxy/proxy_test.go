@@ -46,6 +46,8 @@ func newFixture(t *testing.T) *fixture {
 			return
 		}
 		w.Header().Set("Set-Cookie", "x=y")
+		w.Header().Set("Cache-Control", "public, max-age=31536000")
+		w.Header().Set("Expires", "Thu, 01 Jan 2099 00:00:00 GMT")
 		_, _ = io.WriteString(w, body)
 	}))
 	t.Cleanup(bucket.Close)
@@ -144,6 +146,9 @@ func TestS3HitIsProxied(t *testing.T) {
 	}
 	if resp.Header.Get("Set-Cookie") != "" {
 		t.Fatal("upstream Set-Cookie must be stripped")
+	}
+	if resp.Header.Get("Cache-Control") != "" || resp.Header.Get("Expires") != "" {
+		t.Fatal("upstream cache headers must be stripped")
 	}
 	if p := <-f.upHits; p != "/file/bkt/img/a/cat jpg.png" {
 		t.Fatalf("upstream path = %q", p)

@@ -124,6 +124,10 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		return &upstreamMiss{status: resp.StatusCode}
 	}
 	resp.Header.Del("Set-Cookie")
+	// Caching is not managed by the S3 tier: drop any policy coming from object metadata or
+	// bucket defaults so responses carry the same cache headers whichever tier served them.
+	resp.Header.Del("Cache-Control")
+	resp.Header.Del("Expires")
 	resp.Header.Set(TierHeader, "s3")
 	return nil
 }

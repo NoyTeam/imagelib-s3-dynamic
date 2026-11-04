@@ -129,7 +129,6 @@ func newHarness(t *testing.T) *harness {
 				Prefix:         run, // isolate objects of this run
 				PublicURL:      publicURL,
 				ForcePathStyle: true,
-				CacheControl:   "public, max-age=60",
 			},
 			Proxy: config.ProxyConfig{
 				EventBuffer: 1024, StreamMaxLen: 10000,
@@ -289,6 +288,19 @@ func TestEndToEnd(t *testing.T) {
 		}
 		if st := h.bucketStatus("photos/a.jpg"); st != 200 {
 			t.Fatalf("public bucket GET = %d", st)
+		}
+		// The S3 tier does not manage caching: no metadata stored, nothing forwarded.
+		if resp, err := http.Get(h.s3Public + "/photos/a.jpg"); err == nil {
+			resp.Body.Close()
+			if cc := resp.Header.Get("Cache-Control"); cc != "" {
+				t.Fatalf("object stored with Cache-Control %q", cc)
+			}
+		}
+		if resp, err := http.Get(one.url + "/photos/a.jpg"); err == nil {
+			resp.Body.Close()
+			if cc := resp.Header.Get("Cache-Control"); cc != "" || resp.Header.Get(proxy.TierHeader) != "s3" {
+				t.Fatalf("s3-tier response: tier=%s Cache-Control=%q", resp.Header.Get(proxy.TierHeader), cc)
+			}
 		}
 		// Range requests are proxied too.
 		req, _ := http.NewRequest(http.MethodGet, one.url+"/photos/a.jpg", nil)
