@@ -7,10 +7,11 @@ import (
 )
 
 type Config struct {
-	Addr     string
-	Database string
-	Redis    RedisConfig
-	Storage  StorageConfig
+	Addr      string
+	Database  string
+	Redis     RedisConfig
+	Storage   StorageConfig
+	LocalPath string
 }
 
 type RedisConfig struct {
@@ -33,8 +34,9 @@ func Load() Config {
 	_ = godotenv.Load()
 
 	return Config{
-		Addr:     getEnv("ADDR", ":8080"),
-		Database: getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/imagelib?sslmode=disable"),
+		Addr:      getEnv("ADDR", ":8080"),
+		Database:  getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/imagelib?sslmode=disable"),
+		LocalPath: getEnv("LOCAL_PATH", "./data"),
 		Redis: RedisConfig{
 			Addr:     getEnv("REDIS_ADDR", "localhost:6379"),
 			Password: os.Getenv("REDIS_PASSWORD"),
