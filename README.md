@@ -384,15 +384,11 @@ correctly from local disk.
 
 ### Schema changes
 
-The schema lives in `schema/schema.gcorm` and is embedded into the binary. Regenerate the
+The schema lives in `schema/schema.gcorm` and is managed by
+[GCORM](https://github.com/arsfy/gcorm), embedded into the binary. Regenerate the
 client with `gco generate`. Destructive changes are refused on startup with a list of the
 offending changes. Review them, then start once with `DB_PUSH_ALLOW_DESTRUCTIVE=true` or run
 `gco db push --force`.
-
-Upgrading an existing database to the current schema drops the old `url` column and the
-`idx_images_status` index (replaced by the partial index `idx_images_s3_key` on S3-resident
-rows), so it needs one destructive push. On a large `images` table, building the new index
-blocks writes to the table for a short while during startup (tens of seconds at 30M rows).
 
 ## Development
 
