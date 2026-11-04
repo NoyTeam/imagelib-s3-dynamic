@@ -1,4 +1,4 @@
-# imagelib-s3-dynamic
+# ImageLib: Dynamic Object Storage Scheduler
 
 [![Go](https://img.shields.io/badge/Go-1.27-00ADD8?logo=go)](go.mod)
 [![Storage](https://img.shields.io/badge/storage-S3%20compatible-569A31)](#s3--bucket)
