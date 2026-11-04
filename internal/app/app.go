@@ -72,7 +72,10 @@ func Run(ctx context.Context, cfg config.Config, opts ...Option) error {
 	var handler http.Handler
 	if cfg.RunsProxy() {
 		pub := events.NewPublisher(rdb, index.Keys().Events, cfg.Proxy.StreamMaxLen, cfg.Proxy.EventBuffer)
-		images = proxy.New(cfg.Proxy, local, index, storage.NewObjectNamer(cfg.Storage), pub)
+		images, err = proxy.New(cfg.Proxy, local, index, storage.NewObjectNamer(cfg.Storage), pub)
+		if err != nil {
+			return fmt.Errorf("proxy: %w", err)
+		}
 		handler = images
 	}
 

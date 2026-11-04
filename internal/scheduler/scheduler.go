@@ -261,7 +261,7 @@ func (s *Scheduler) handleBatch(ctx context.Context, msgs []redis.XMessage) {
 			aggs[e.Key] = a
 		}
 		if e.Size > 0 {
-			a.hits++
+			a.hits += e.Reads()
 			a.size = e.Size
 		}
 		if e.At.After(a.last) {

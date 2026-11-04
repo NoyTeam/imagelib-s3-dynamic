@@ -59,6 +59,8 @@ type StorageConfig struct {
 
 type ProxyConfig struct {
 	LookupTimeout         time.Duration // per-request index lookup timeout
+	IndexCacheTTL         time.Duration // in-process index cache TTL (0 disables; must be < EVICT_DELETE_DELAY)
+	IndexCacheMaxKeys     int64         // max cached keys
 	RedisBreakerThreshold int           // consecutive lookup failures before serving local without asking Redis
 	RedisBreakerCooldown  time.Duration
 	S3BreakerThreshold    int // consecutive S3 failures (5xx/timeout/conn) before bypassing S3
@@ -123,6 +125,8 @@ func Load() (Config, error) {
 		},
 		Proxy: ProxyConfig{
 			LookupTimeout:         p.duration("REDIS_LOOKUP_TIMEOUT", 100*time.Millisecond),
+			IndexCacheTTL:         p.duration("INDEX_CACHE_TTL", time.Second),
+			IndexCacheMaxKeys:     int64(p.int("INDEX_CACHE_MAX_KEYS", 100000)),
 			RedisBreakerThreshold: p.int("REDIS_BREAKER_THRESHOLD", 5),
 			RedisBreakerCooldown:  p.duration("REDIS_BREAKER_COOLDOWN", 5*time.Second),
 			S3BreakerThreshold:    p.int("S3_BREAKER_THRESHOLD", 5),
@@ -189,6 +193,17 @@ func (c Config) validate() error {
 		}
 		if c.Scheduler.HalfLife <= 0 || c.Scheduler.LeaderTTL < time.Second {
 			return fmt.Errorf("MIGRATE_HALF_LIFE must be > 0 and LEADER_TTL >= 1s")
+		}
+	}
+	if c.RunsProxy() && c.Proxy.IndexCacheTTL > 0 {
+		// A cached "in S3" must expire before an evicted object is deleted from the bucket.
+		// EVICT_DELETE_DELAY is a scheduler setting: keep it identical on proxy-only processes.
+		if c.Proxy.IndexCacheTTL >= c.Scheduler.DeleteDelay {
+			return fmt.Errorf("INDEX_CACHE_TTL (%s) must be shorter than EVICT_DELETE_DELAY (%s)",
+				c.Proxy.IndexCacheTTL, c.Scheduler.DeleteDelay)
+		}
+		if c.Proxy.IndexCacheMaxKeys <= 0 {
+			return fmt.Errorf("INDEX_CACHE_MAX_KEYS must be > 0")
 		}
 	}
 	if c.Redis.Timeout <= 0 || c.Proxy.LookupTimeout <= 0 {

@@ -135,7 +135,8 @@ func newHarness(t *testing.T) *harness {
 			Proxy: config.ProxyConfig{
 				EventBuffer: 1024, StreamMaxLen: 10000,
 				TouchInterval: 100 * time.Millisecond, UpstreamTimeout: 5 * time.Second,
-				LookupTimeout:         200 * time.Millisecond,
+				LookupTimeout: 200 * time.Millisecond,
+				IndexCacheTTL: 200 * time.Millisecond, IndexCacheMaxKeys: 10000,
 				RedisBreakerThreshold: 5, RedisBreakerCooldown: time.Second,
 				S3BreakerThreshold: 5, S3BreakerCooldown: time.Second,
 			},
@@ -230,6 +231,23 @@ func (h *harness) get(inst *instance, key string) (tier string) {
 	return resp.Header.Get(proxy.TierHeader)
 }
 
+// expectTier waits until key is served from tier via inst (the in-process index cache may
+// lag the shared index by up to INDEX_CACHE_TTL).
+func (h *harness) expectTier(inst *instance, key, tier string) {
+	h.t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		got := h.get(inst, key)
+		if got == tier {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("%s via %s: tier %s, want %s", key, inst.id, got, tier)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 func (h *harness) bucketStatus(key string) int {
 	h.t.Helper()
 	resp, err := http.Get(h.s3Public + "/" + key)
@@ -297,9 +315,7 @@ func TestEndToEnd(t *testing.T) {
 		h.get(two, "photos/a.jpg")
 		eventually(t, "a in s3", 5*time.Second, func() bool { return h.dbStatus("photos/a.jpg") == "s3" })
 		for _, inst := range []*instance{one, two} {
-			if tier := h.get(inst, "photos/a.jpg"); tier != "s3" {
-				t.Fatalf("tier via %s = %s, want s3", inst.id, tier)
-			}
+			h.expectTier(inst, "photos/a.jpg", "s3")
 		}
 		if st := h.bucketStatus("photos/a.jpg"); st != 200 {
 			t.Fatalf("public bucket GET = %d", st)
@@ -348,9 +364,7 @@ func TestEndToEnd(t *testing.T) {
 		if h.dbStatus("photos/a.jpg") != "local" {
 			t.Fatal("a should have been evicted")
 		}
-		if tier := h.get(two, "photos/b.jpg"); tier != "s3" {
-			t.Fatalf("b tier = %s", tier)
-		}
+		h.expectTier(two, "photos/b.jpg", "s3")
 		eventually(t, "a deleted from silo", 5*time.Second, func() bool { return h.bucketStatus("photos/a.jpg") == 404 })
 		total, _ := h.rdb.Get(context.Background(), h.keys.Bytes).Int64()
 		if total > h.base.Scheduler.CapacityBytes {
@@ -371,9 +385,7 @@ func TestEndToEnd(t *testing.T) {
 		h.get(survivor, "photos/c.png")
 		h.get(survivor, "photos/c.png")
 		eventually(t, "c in s3 via new leader", 5*time.Second, func() bool { return h.dbStatus("photos/c.png") == "s3" })
-		if tier := h.get(survivor, "photos/c.png"); tier != "s3" {
-			t.Fatalf("c tier = %s", tier)
-		}
+		h.expectTier(survivor, "photos/c.png", "s3")
 	})
 
 	t.Run("index lost while leading is rebuilt live", func(t *testing.T) {
@@ -391,9 +403,7 @@ func TestEndToEnd(t *testing.T) {
 			ok, _ := h.rdb.HExists(ctx, h.keys.Objects, "photos/b.jpg").Result()
 			return ok
 		})
-		if tier := h.get(survivor, "photos/b.jpg"); tier != "s3" {
-			t.Fatalf("b tier after live rebuild = %s", tier)
-		}
+		h.expectTier(survivor, "photos/b.jpg", "s3")
 		var hz map[string]string
 		resp, err := http.Get(survivor.url + "/healthz")
 		if err != nil {
@@ -416,9 +426,7 @@ func TestEndToEnd(t *testing.T) {
 			ok, _ := h.rdb.HExists(ctx, h.keys.Objects, "photos/b.jpg").Result()
 			return ok
 		})
-		if tier := h.get(three, "photos/b.jpg"); tier != "s3" {
-			t.Fatalf("b tier after rebuild = %s", tier)
-		}
+		h.expectTier(three, "photos/b.jpg", "s3")
 		if total, _ := h.rdb.Get(ctx, h.keys.Bytes).Int64(); total != 9000 {
 			t.Fatalf("rebuilt total = %d, want 9000", total)
 		}

@@ -11,11 +11,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Event is emitted every time a request is served from local storage.
+// Event is emitted every time a request is served from local storage. The publisher merges
+// events for the same key within a flush window, so one stream entry may stand for Count reads.
 type Event struct {
-	Key  string
-	Size int64
-	At   time.Time
+	Key   string
+	Size  int64
+	At    time.Time
+	Count int64 // number of reads represented; 0 is treated as 1
 	// Stale is set when the index pointed at S3 but S3 did not have the object.
 	Stale bool
 }
@@ -29,7 +31,18 @@ func (e Event) Values() map[string]any {
 	if e.Stale {
 		v["x"] = "1"
 	}
+	if e.Count > 1 {
+		v["c"] = e.Count
+	}
 	return v
+}
+
+// Reads returns how many local reads the event represents.
+func (e Event) Reads() int64 {
+	if e.Count < 1 {
+		return 1
+	}
+	return e.Count
 }
 
 // Decode parses a stream message. ok is false for malformed messages.
@@ -49,11 +62,19 @@ func Decode(msg redis.XMessage) (e Event, ok bool) {
 		e.At = time.Now()
 	}
 	e.Stale = msg.Values["x"] == "1"
+	e.Count = 1
+	if c, _ := msg.Values["c"].(string); c != "" {
+		if n, err := strconv.ParseInt(c, 10, 64); err == nil && n > 0 {
+			e.Count = n
+		}
+	}
 	return e, true
 }
 
 // Publisher asynchronously appends events to the stream. Submit never blocks the
 // request path: when the buffer is full events are dropped (heat is approximate anyway).
+// Events for the same key are merged per flush window, so stream writes scale with the
+// number of distinct keys read from local, not with request rate.
 type Publisher struct {
 	rdb    redis.UniversalClient
 	stream string
@@ -104,22 +125,26 @@ func (p *Publisher) Close(ctx context.Context) {
 }
 
 const (
-	batchSize     = 256
-	flushInterval = 50 * time.Millisecond
+	batchKeys     = 256 // distinct keys per flush
+	flushInterval = 100 * time.Millisecond
 )
 
 func (p *Publisher) loop() {
 	defer close(p.done)
-	batch := make([]Event, 0, batchSize)
+	pending := make(map[string]*Event, batchKeys)
 	timer := time.NewTimer(flushInterval)
 	defer timer.Stop()
 
 	flush := func() {
-		if len(batch) == 0 {
+		if len(pending) == 0 {
 			return
 		}
+		batch := make([]Event, 0, len(pending))
+		for _, e := range pending {
+			batch = append(batch, *e)
+		}
 		p.write(batch)
-		batch = batch[:0]
+		clear(pending)
 	}
 
 	for {
@@ -129,8 +154,20 @@ func (p *Publisher) loop() {
 				flush()
 				return
 			}
-			batch = append(batch, e)
-			if len(batch) >= batchSize {
+			if cur, ok := pending[e.Key]; ok {
+				cur.Count = cur.Reads() + e.Reads()
+				if e.At.After(cur.At) {
+					cur.At = e.At
+				}
+				if e.Size > 0 {
+					cur.Size = e.Size
+				}
+				cur.Stale = cur.Stale || e.Stale
+			} else {
+				ev := e
+				pending[e.Key] = &ev
+			}
+			if len(pending) >= batchKeys {
 				flush()
 			}
 		case <-timer.C:
@@ -154,10 +191,14 @@ func (p *Publisher) write(batch []Event) {
 		}
 		return nil
 	})
+	var reads int64
+	for _, e := range batch {
+		reads += e.Reads()
+	}
 	if err != nil {
-		p.dropped.Add(int64(len(batch)))
-		slog.Warn("publish origin events failed", "count", len(batch), "err", err)
+		p.dropped.Add(reads)
+		slog.Warn("publish origin events failed", "count", reads, "err", err)
 		return
 	}
-	p.published.Add(int64(len(batch)))
+	p.published.Add(reads)
 }

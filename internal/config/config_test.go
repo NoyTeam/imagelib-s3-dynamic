@@ -38,3 +38,21 @@ func TestOrphanDeleteRequiresPrefix(t *testing.T) {
 		t.Fatalf("delete with prefix: %v", err)
 	}
 }
+
+func TestIndexCacheTTLMustBeBelowDeleteDelay(t *testing.T) {
+	t.Setenv("S3_BUCKET", "b")
+	t.Setenv("S3_PUBLIC_URL", "http://x")
+	t.Setenv("EVICT_DELETE_DELAY", "5s")
+	t.Setenv("INDEX_CACHE_TTL", "5s")
+	if _, err := Load(); err == nil {
+		t.Fatal("ttl >= delete delay must be rejected")
+	}
+	t.Setenv("INDEX_CACHE_TTL", "1s")
+	if _, err := Load(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("INDEX_CACHE_TTL", "0")
+	if _, err := Load(); err != nil {
+		t.Fatal("0 disables the cache:", err)
+	}
+}

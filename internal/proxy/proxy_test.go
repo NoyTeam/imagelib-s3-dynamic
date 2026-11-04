@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,7 +28,9 @@ type fixture struct {
 	mr      *miniredis.Miniredis
 	rdb     *redis.Client
 	index   *state.Index
-	upHits  chan string
+	upHits  chan string  // recent upstream paths (non-blocking, may drop)
+	upTotal atomic.Int64 // all upstream requests
+	upSeen  int64        // upTotal at the last upstreamCalls()
 	dir     string
 	s3Paths map[string]string // path → body served by the fake bucket
 
@@ -39,7 +42,8 @@ type fixture struct {
 func testProxyConfig() config.ProxyConfig {
 	return config.ProxyConfig{
 		TouchInterval: 10 * time.Millisecond, UpstreamTimeout: time.Second,
-		LookupTimeout:         200 * time.Millisecond,
+		LookupTimeout: 200 * time.Millisecond,
+		IndexCacheTTL: time.Second, IndexCacheMaxKeys: 1000,
 		RedisBreakerThreshold: 3, RedisBreakerCooldown: 100 * time.Millisecond,
 		S3BreakerThreshold: 3, S3BreakerCooldown: 100 * time.Millisecond,
 	}
@@ -53,7 +57,11 @@ func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 
 	f := &fixture{mr: mr, rdb: rdb, upHits: make(chan string, 256), s3Paths: map[string]string{}, dir: t.TempDir()}
 	bucket := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		f.upHits <- r.URL.Path
+		f.upTotal.Add(1)
+		select {
+		case f.upHits <- r.URL.Path:
+		default:
+		}
 		if r.Header.Get("Cookie") != "" {
 			t.Errorf("cookie leaked to upstream")
 		}
@@ -93,7 +101,11 @@ func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 	for _, o := range opts {
 		o(&cfg)
 	}
-	f.h = New(cfg, local, f.index, namer, pub)
+	h, err := New(cfg, local, f.index, namer, pub)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.h = h
 	t.Cleanup(func() { f.h.Close(context.Background()) })
 	return f
 }
@@ -226,16 +238,12 @@ func TestRedisDownServesLocal(t *testing.T) {
 	}
 }
 
+// upstreamCalls returns the number of upstream requests since the previous call.
 func (f *fixture) upstreamCalls() int {
-	n := 0
-	for {
-		select {
-		case <-f.upHits:
-			n++
-		default:
-			return n
-		}
-	}
+	total := f.upTotal.Load()
+	n := total - f.upSeen
+	f.upSeen = total
+	return int(n)
 }
 
 func TestRedisBreakerSkipsRedisWhileOpen(t *testing.T) {
@@ -293,7 +301,7 @@ func TestHungRedisFailsFast(t *testing.T) {
 
 	f := newFixture(t)
 	f.writeLocal(t, "h.png", "local")
-	f.h.index = state.NewIndex(hung, state.NewKeys("t:"))
+	f.h.lookup.index = state.NewIndex(hung, state.NewKeys("t:"))
 
 	start := time.Now()
 	resp := f.get(t, "/h.png")
@@ -381,5 +389,85 @@ func TestS3NotFoundDoesNotTripBreaker(t *testing.T) {
 	}
 	if f.h.Health()["s3_breaker"] != "closed" {
 		t.Fatal("404s are per-object staleness, not an outage")
+	}
+}
+
+func TestIndexCacheCoalescesAndCaches(t *testing.T) {
+	f := newFixture(t, func(c *config.ProxyConfig) { c.IndexCacheTTL = 300 * time.Millisecond })
+	f.writeLocal(t, "hot.png", "local")
+	f.s3Paths["/file/bkt/img/hot.png"] = "s3"
+	_, _ = f.index.Add(context.Background(), "hot.png", 5, time.Now())
+
+	// A burst of concurrent requests for one key → (about) one Redis lookup.
+	var wg sync.WaitGroup
+	for range 200 {
+		wg.Go(func() {
+			if tier := f.get(t, "/hot.png").Header.Get(TierHeader); tier != "s3" {
+				t.Errorf("tier = %s", tier)
+			}
+		})
+	}
+	wg.Wait()
+	f.h.lookup.cache.Wait()
+	burst := f.h.lookup.redisCalls.Load()
+	if burst > 5 {
+		t.Fatalf("200 concurrent requests made %d redis lookups", burst)
+	}
+
+	// Within TTL: served from the in-process cache.
+	for range 100 {
+		f.get(t, "/hot.png")
+	}
+	if n := f.h.lookup.redisCalls.Load(); n != burst {
+		t.Fatalf("cached requests hit redis: %d → %d", burst, n)
+	}
+
+	// After TTL: one refresh.
+	time.Sleep(350 * time.Millisecond)
+	f.get(t, "/hot.png")
+	if n := f.h.lookup.redisCalls.Load(); n != burst+1 {
+		t.Fatalf("expected one refresh after ttl, got %d → %d", burst, n)
+	}
+}
+
+func TestIndexCacheNegativeEntries(t *testing.T) {
+	f := newFixture(t)
+	f.writeLocal(t, "cold.png", "local")
+	f.get(t, "/cold.png")
+	f.h.lookup.cache.Wait()
+	for range 50 {
+		f.get(t, "/cold.png")
+	}
+	if n := f.h.lookup.redisCalls.Load(); n != 1 {
+		t.Fatalf("not-in-s3 must be cached too, got %d lookups", n)
+	}
+}
+
+func TestStaleResponseInvalidatesCache(t *testing.T) {
+	f := newFixture(t)
+	f.writeLocal(t, "gone.png", "local")
+	_, _ = f.index.Add(context.Background(), "gone.png", 5, time.Now()) // indexed, missing in bucket
+
+	if body(t, f.get(t, "/gone.png")) != "local" {
+		t.Fatal("must fall back")
+	}
+	f.h.lookup.cache.Wait()
+	f.upstreamCalls()
+	for range 10 {
+		f.get(t, "/gone.png")
+	}
+	if n := f.upstreamCalls(); n != 0 {
+		t.Fatalf("stale key still sent to S3 %d times within ttl", n)
+	}
+}
+
+func TestIndexCacheDisabled(t *testing.T) {
+	f := newFixture(t, func(c *config.ProxyConfig) { c.IndexCacheTTL = 0 })
+	f.writeLocal(t, "n.png", "x")
+	for range 3 {
+		f.get(t, "/n.png")
+	}
+	if f.h.lookup.cache != nil || f.h.lookup.redisCalls.Load() != 3 {
+		t.Fatalf("cache disabled: calls = %d", f.h.lookup.redisCalls.Load())
 	}
 }
