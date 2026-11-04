@@ -32,6 +32,8 @@ const consumerGroup = "migrator"
 type Uploader interface {
 	Put(ctx context.Context, key string, body io.ReaderAt, size int64, contentType string) error
 	Delete(ctx context.Context, key string) error
+	// List calls fn for every object under the configured prefix (keys without prefix).
+	List(ctx context.Context, fn func(key string, size int64, modified time.Time) error) error
 }
 
 type Scheduler struct {
@@ -51,6 +53,10 @@ type Scheduler struct {
 	busy   map[string]struct{}
 	// backoff holds keys whose migration was rejected for lack of evictable space.
 	backoff map[string]time.Time
+
+	// indexMu: index rebuilds take it exclusively; every compound PG+index write holds it
+	// shared, so a rebuild never interleaves with (and silently undoes) such a write.
+	indexMu sync.RWMutex
 
 	// capMu serialises capacity decisions; reserved counts bytes of in-flight uploads.
 	capMu    sync.Mutex
@@ -99,6 +105,8 @@ func (s *Scheduler) Lead(ctx context.Context) {
 		wg.Go(func() { s.worker(ctx) })
 	}
 	wg.Go(func() { s.capacityLoop(ctx) })
+	wg.Go(func() { s.indexCheckLoop(ctx) })
+	wg.Go(func() { s.reconcileLoop(ctx) })
 	wg.Go(func() { s.trashLoop(ctx) })
 	wg.Go(func() { s.statsLoop(ctx) })
 	wg.Go(func() { s.heatGCLoop(ctx) })
@@ -114,12 +122,45 @@ func (s *Scheduler) ensureIndex(ctx context.Context) error {
 	if err != nil || ok {
 		return err
 	}
+	return s.rebuildIndex(ctx)
+}
+
+// rebuildIndex replaces the Redis index with the PG view (PG is the durable source of truth).
+func (s *Scheduler) rebuildIndex(ctx context.Context) error {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	if ok, err := s.index.Initialized(ctx); err != nil || ok {
+		return err // someone (a previous loop iteration) already rebuilt it
+	}
 	entries, err := s.store.listS3(ctx)
 	if err != nil {
 		return err
 	}
 	slog.Info("rebuilding S3 index from postgres", "objects", len(entries))
 	return s.index.Rebuild(ctx, entries)
+}
+
+// indexCheckLoop detects an index lost while we lead (Redis flushed/restarted without
+// persistence, keys evicted) and rebuilds it. Until then proxies simply serve local and
+// index writes fail with state.ErrNotInitialized.
+func (s *Scheduler) indexCheckLoop(ctx context.Context) {
+	tick := time.NewTicker(s.cfg.IndexCheckInterval)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		ok, err := s.index.Initialized(ctx)
+		if err != nil || ok {
+			continue
+		}
+		slog.Warn("s3 index lost, rebuilding from postgres")
+		if err := s.rebuildIndex(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("index rebuild failed", "err", err)
+		}
+	}
 }
 
 func (s *Scheduler) ensureGroup(ctx context.Context) error {
@@ -167,6 +208,13 @@ func (s *Scheduler) consume(ctx context.Context) {
 				return
 			}
 			slog.Warn("read events failed", "err", err)
+			if strings.HasPrefix(err.Error(), "NOGROUP") {
+				// Stream/group lost (FLUSHALL, eviction): recreate and keep consuming.
+				if gerr := s.ensureGroup(ctx); gerr == nil {
+					slog.Info("recreated event consumer group")
+					continue
+				}
+			}
 			sleep(ctx, time.Second)
 			continue
 		}
@@ -439,6 +487,10 @@ func (s *Scheduler) worker(ctx context.Context) {
 }
 
 func (s *Scheduler) migrate(ctx context.Context, key string) error {
+	// While the index is lost "not indexed" means nothing; wait for the rebuild.
+	if ok, err := s.index.Initialized(ctx); err != nil || !ok {
+		return err
+	}
 	if ok, err := s.index.Contains(ctx, key); err != nil || ok {
 		return err
 	}
@@ -479,12 +531,20 @@ func (s *Scheduler) migrate(ctx context.Context, key string) error {
 		return errors.New("local file changed during upload")
 	}
 
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
 	now := s.now()
 	if err := s.store.markS3(ctx, key, contentType, size, now); err != nil {
 		s.deleteQuietly(key)
 		return err
 	}
 	total, err := s.index.Add(ctx, key, size, now)
+	if errors.Is(err, state.ErrNotInitialized) {
+		// Index was lost mid-commit. PG already says s3 and the object is uploaded, which is
+		// exactly what the pending rebuild (blocked on indexMu until we return) will restore.
+		slog.Warn("index lost during migration commit; rebuild will restore it", "key", key)
+		return nil
+	}
 	if err != nil {
 		// Roll PG back so it never claims an object Redis doesn't serve.
 		bg, c := context.WithTimeout(context.Background(), 5*time.Second)
@@ -517,6 +577,8 @@ func (s *Scheduler) handleStale(ctx context.Context, key string) {
 		return
 	}
 	defer s.unlock(key)
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
 	freed, err := s.index.Remove(ctx, key)
 	if err != nil {
 		slog.Warn("remove stale index entry failed", "key", key, "err", err)
@@ -620,6 +682,8 @@ func (s *Scheduler) evictOne(ctx context.Context, idleBefore time.Time) (bool, e
 // evict de-indexes key (proxies immediately fall back to local), marks it local in PG and
 // schedules the S3 delete after a grace period so in-flight proxied responses can finish.
 func (s *Scheduler) evict(ctx context.Context, key string) error {
+	s.indexMu.RLock()
+	defer s.indexMu.RUnlock()
 	freed, err := s.index.Remove(ctx, key)
 	if err != nil {
 		return err

@@ -2,6 +2,9 @@
 //
 //	lookup Redis index ─┬─ hit  → reverse proxy to the S3 public url (falls back to local on miss)
 //	                    └─ miss → stream from local disk + async origin event
+//
+// Both dependencies are guarded: the index lookup has a short timeout and a circuit breaker,
+// and S3 has its own breaker. Whenever either is unhealthy, requests are served from local.
 package proxy
 
 import (
@@ -17,6 +20,7 @@ import (
 	"strconv"
 	"time"
 
+	"imagelib-s3-dynamic/internal/breaker"
 	"imagelib-s3-dynamic/internal/config"
 	"imagelib-s3-dynamic/internal/events"
 	"imagelib-s3-dynamic/internal/state"
@@ -26,6 +30,10 @@ import (
 const TierHeader = "X-Storage-Tier"
 
 type Handler struct {
+	lookupTimeout time.Duration
+	redisBreaker  *breaker.Breaker
+	s3Breaker     *breaker.Breaker
+
 	local   *storage.Local
 	index   *state.Index
 	namer   storage.ObjectNamer
@@ -44,18 +52,21 @@ func (e *upstreamMiss) Error() string { return fmt.Sprintf("s3 upstream status %
 
 func New(cfg config.ProxyConfig, local *storage.Local, index *state.Index, namer storage.ObjectNamer, pub *events.Publisher) *Handler {
 	h := &Handler{
-		local:   local,
-		index:   index,
-		namer:   namer,
-		pub:     pub,
-		touch:   newToucher(index, cfg.TouchInterval),
-		nowFunc: time.Now,
+		lookupTimeout: cfg.LookupTimeout,
+		redisBreaker:  breaker.New("redis-index", cfg.RedisBreakerThreshold, cfg.RedisBreakerCooldown),
+		s3Breaker:     breaker.New("s3-upstream", cfg.S3BreakerThreshold, cfg.S3BreakerCooldown),
+		local:         local,
+		index:         index,
+		namer:         namer,
+		pub:           pub,
+		touch:         newToucher(index, cfg.TouchInterval),
+		nowFunc:       time.Now,
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = cfg.UpstreamTimeout
 	transport.MaxIdleConnsPerHost = 256
-	transport.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	transport.DialContext = (&net.Dialer{Timeout: min(cfg.UpstreamTimeout, 5*time.Second), KeepAlive: 30 * time.Second}).DialContext
 
 	h.rp = &httputil.ReverseProxy{
 		Transport:      transport,
@@ -85,18 +96,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inS3, err := h.index.Contains(r.Context(), key)
-	if err != nil {
-		// Redis trouble must not take the site down: local always has the object.
-		slog.Warn("index lookup failed, serving local", "key", key, "err", err)
-		inS3 = false
-	}
-	if inS3 {
+	if h.lookup(r, key) && h.s3Breaker.Allow() {
 		h.touch.add(key)
 		h.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, key)))
 		return
 	}
 	h.serveLocal(w, r, key, false)
+}
+
+// lookup asks the index whether key lives in S3. Any Redis trouble (error, timeout, open
+// breaker) answers false: local always has the object, so degrading is always correct.
+func (h *Handler) lookup(r *http.Request, key string) bool {
+	if !h.redisBreaker.Allow() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), h.lookupTimeout)
+	defer cancel()
+	inS3, err := h.index.Contains(ctx, key)
+	switch {
+	case err == nil:
+		h.redisBreaker.Success()
+		return inS3
+	case r.Context().Err() != nil:
+		return false // client went away; says nothing about Redis health
+	default:
+		h.redisBreaker.Failure()
+		slog.Warn("index lookup failed, serving local", "key", key, "err", err)
+		return false
+	}
+}
+
+// Health reports dependency circuit breaker states for /healthz.
+func (h *Handler) Health() map[string]string {
+	return map[string]string{
+		"redis_breaker": h.redisBreaker.State().String(),
+		"s3_breaker":    h.s3Breaker.State().String(),
+	}
 }
 
 func (h *Handler) rewrite(pr *httputil.ProxyRequest) {
@@ -114,6 +149,12 @@ func (h *Handler) rewrite(pr *httputil.ProxyRequest) {
 }
 
 func (h *Handler) modifyResponse(resp *http.Response) error {
+	// 404/403/… are per-object (stale index) problems, not an S3 outage.
+	if resp.StatusCode >= 500 {
+		h.s3Breaker.Failure()
+	} else {
+		h.s3Breaker.Success()
+	}
 	switch {
 	case resp.StatusCode == http.StatusNotFound,
 		resp.StatusCode == http.StatusForbidden,
@@ -138,7 +179,10 @@ func (h *Handler) upstreamError(w http.ResponseWriter, r *http.Request, err erro
 	}
 	key := r.Context().Value(ctxKey{}).(string)
 	var miss *upstreamMiss
-	stale := errors.As(err, &miss) && miss.status < 500
+	if !errors.As(err, &miss) {
+		h.s3Breaker.Failure() // connection error / timeout (status errors were counted already)
+	}
+	stale := miss != nil && miss.status < 500
 	slog.Warn("s3 upstream failed, falling back to local", "key", key, "err", err, "stale", stale)
 	h.serveLocal(w, r, key, stale)
 }

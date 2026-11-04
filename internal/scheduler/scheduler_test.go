@@ -19,9 +19,10 @@ import (
 )
 
 type fakeS3 struct {
-	mu      sync.Mutex
-	objects map[string]string
-	deletes []string
+	mu       sync.Mutex
+	objects  map[string]string
+	modified map[string]time.Time
+	deletes  []string
 }
 
 func (f *fakeS3) Put(_ context.Context, key string, body io.ReaderAt, size int64, _ string) error {
@@ -31,8 +32,36 @@ func (f *fakeS3) Put(_ context.Context, key string, body io.ReaderAt, size int64
 	}
 	f.mu.Lock()
 	f.objects[key] = string(b)
+	f.modified[key] = time.Now()
 	f.mu.Unlock()
 	return nil
+}
+
+func (f *fakeS3) List(_ context.Context, fn func(string, int64, time.Time) error) error {
+	f.mu.Lock()
+	type obj struct {
+		k string
+		n int64
+		m time.Time
+	}
+	var objs []obj
+	for k, v := range f.objects {
+		objs = append(objs, obj{k, int64(len(v)), f.modified[k]})
+	}
+	f.mu.Unlock()
+	for _, o := range objs {
+		if err := fn(o.k, o.n, o.m); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *fakeS3) putAt(key, body string, at time.Time) {
+	f.mu.Lock()
+	f.objects[key] = body
+	f.modified[key] = at
+	f.mu.Unlock()
 }
 
 func (f *fakeS3) Delete(_ context.Context, key string) error {
@@ -51,17 +80,36 @@ func (f *fakeS3) has(key string) bool {
 }
 
 type fakeStore struct {
-	mu     sync.Mutex
-	status map[string]string
-	hits   map[string]int64
-	seed   []state.Entry
+	onMarkS3 func(key string) // test hook, runs before the write
+	mu       sync.Mutex
+	status   map[string]string
+	sizes    map[string]int64
+	hits     map[string]int64
 }
 
-func (f *fakeStore) markS3(_ context.Context, key, _ string, _ int64, _ time.Time) error {
+func (f *fakeStore) set(key, status string, size int64) {
 	f.mu.Lock()
-	f.status[key] = StatusS3
+	f.status[key] = status
+	f.sizes[key] = size
 	f.mu.Unlock()
+}
+
+func (f *fakeStore) markS3(_ context.Context, key, _ string, size int64, _ time.Time) error {
+	if f.onMarkS3 != nil {
+		f.onMarkS3(key)
+	}
+	f.set(key, StatusS3, size)
 	return nil
+}
+
+func (f *fakeStore) find(_ context.Context, key string) (*row, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	st, ok := f.status[key]
+	if !ok {
+		return nil, nil
+	}
+	return &row{Status: st, Size: f.sizes[key], LastAccess: time.Now().Add(-time.Hour)}, nil
 }
 
 func (f *fakeStore) markLocal(_ context.Context, key string, _ time.Time) error {
@@ -71,7 +119,17 @@ func (f *fakeStore) markLocal(_ context.Context, key string, _ time.Time) error 
 	return nil
 }
 
-func (f *fakeStore) listS3(context.Context) ([]state.Entry, error) { return f.seed, nil }
+func (f *fakeStore) listS3(context.Context) ([]state.Entry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []state.Entry
+	for k, st := range f.status {
+		if st == StatusS3 {
+			out = append(out, state.Entry{Key: k, Size: f.sizes[k], LastAccess: time.Now().Add(-time.Hour)})
+		}
+	}
+	return out, nil
+}
 
 func (f *fakeStore) flushStats(_ context.Context, rows map[string]*statRow) error {
 	f.mu.Lock()
@@ -112,8 +170,8 @@ func newEnv(t *testing.T, capacity int64, opts ...func(*config.SchedulerConfig))
 	e := &env{
 		rdb:   rdb,
 		index: state.NewIndex(rdb, state.NewKeys("t:")),
-		s3:    &fakeS3{objects: map[string]string{}},
-		store: &fakeStore{status: map[string]string{}, hits: map[string]int64{}},
+		s3:    &fakeS3{objects: map[string]string{}, modified: map[string]time.Time{}},
+		store: &fakeStore{status: map[string]string{}, sizes: map[string]int64{}, hits: map[string]int64{}},
 		dir:   dir,
 	}
 	cfg := config.SchedulerConfig{
@@ -127,6 +185,9 @@ func newEnv(t *testing.T, capacity int64, opts ...func(*config.SchedulerConfig))
 		StatsFlushInterval: 20 * time.Millisecond,
 		LeaderTTL:          time.Second,
 		RetryBackoff:       time.Minute,
+		IndexCheckInterval: 20 * time.Millisecond,
+		ReconcileOrphans:   "log",
+		OrphanMinAge:       time.Hour,
 	}
 	for _, o := range opts {
 		o(&cfg)
@@ -259,10 +320,10 @@ func TestCapacityShrinkEnforced(t *testing.T) {
 	e := newEnv(t, 10)
 	now := time.Now()
 	// Index built from PG with more than capacity (e.g. S3_CAPACITY was lowered).
-	e.store.seed = []state.Entry{
+	_ = e.index.Rebuild(context.Background(), []state.Entry{
 		{Key: "old", Size: 8, LastAccess: now.Add(-time.Hour)},
 		{Key: "new", Size: 8, LastAccess: now},
-	}
+	})
 	e.start(t)
 	eventually(t, "old evicted", func() bool { return !e.indexed("old") && e.indexed("new") })
 }
@@ -270,6 +331,7 @@ func TestCapacityShrinkEnforced(t *testing.T) {
 func TestStaleEntryRemoved(t *testing.T) {
 	e := newEnv(t, 100)
 	e.start(t)
+	eventually(t, "index ready", func() bool { ok, _ := e.index.Initialized(context.Background()); return ok })
 	_, _ = e.index.Add(context.Background(), "gone.png", 5, time.Now())
 	ev := events.Event{Key: "gone.png", At: time.Now(), Stale: true}
 	_ = e.rdb.XAdd(context.Background(), &redis.XAddArgs{Stream: e.index.Keys().Events, Values: ev.Values()}).Err()
@@ -318,4 +380,132 @@ func TestElectorSingleLeader(t *testing.T) {
 	if maxActive != 1 || leads["one"] != 1 {
 		t.Fatalf("maxActive=%d leads=%v", maxActive, leads)
 	}
+}
+
+func TestIndexLossRebuiltWhileLeading(t *testing.T) {
+	e := newEnv(t, 100)
+	e.store.set("kept.png", StatusS3, 7)
+	e.start(t)
+	eventually(t, "initial build", func() bool { return e.indexed("kept.png") })
+
+	e.rdb.FlushAll(context.Background()) // Redis restarted without persistence
+	eventually(t, "rebuilt after loss", func() bool { return e.indexed("kept.png") })
+	if total, _ := e.index.TotalBytes(context.Background()); total != 7 {
+		t.Fatalf("total = %d", total)
+	}
+}
+
+func TestReconcile(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, 1000)
+	now := time.Now()
+	_ = e.index.Rebuild(ctx, nil)
+
+	// PG says s3, index lost the entry → restored.
+	e.store.set("restore.png", StatusS3, 5)
+	e.s3.putAt("restore.png", "12345", now.Add(-2*time.Hour))
+	// Index has it, PG says local → dropped and queued for deletion.
+	e.store.set("drop.png", StatusLocal, 3)
+	_, _ = e.index.Add(ctx, "drop.png", 3, now)
+	e.s3.putAt("drop.png", "abc", now.Add(-2*time.Hour))
+	// Eviction de-indexed + trashed it but PG update failed → finish eviction.
+	e.store.set("evicting.png", StatusS3, 4)
+	_ = e.index.ScheduleDelete(ctx, "evicting.png", now.Add(time.Hour))
+	e.s3.putAt("evicting.png", "abcd", now.Add(-2*time.Hour))
+	// Consistent object.
+	e.store.set("ok.png", StatusS3, 2)
+	_, _ = e.index.Add(ctx, "ok.png", 2, now)
+	e.s3.putAt("ok.png", "ok", now.Add(-2*time.Hour))
+	// Orphans: old one is reported, young one is ignored (upload may be committing).
+	e.s3.putAt("orphan-old.png", "zz", now.Add(-2*time.Hour))
+	e.s3.putAt("orphan-young.png", "zz", now)
+	// Counter drift.
+	_ = e.rdb.Set(ctx, e.index.Keys().Bytes, 999, 0).Err()
+
+	if err := e.sched.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !e.indexed("restore.png") {
+		t.Error("restore.png should be restored")
+	}
+	if e.indexed("drop.png") {
+		t.Error("drop.png should be dropped")
+	}
+	if in, _ := e.index.InTrash(ctx, "drop.png"); !in {
+		t.Error("drop.png should be scheduled for deletion")
+	}
+	if st, _ := e.store.get("evicting.png"); st != StatusLocal || e.indexed("evicting.png") {
+		t.Errorf("evicting.png: status %s indexed %v", st, e.indexed("evicting.png"))
+	}
+	if total, _ := e.index.TotalBytes(ctx); total != 5+2 {
+		t.Errorf("total = %d, want 7", total)
+	}
+	if !e.s3.has("orphan-old.png") {
+		t.Error("log mode must not delete orphans")
+	}
+
+	// Delete mode removes only the old orphan; trashed/indexed objects are untouched.
+	e.sched.cfg.ReconcileOrphans = "delete"
+	if err := e.sched.reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e.s3.has("orphan-old.png") {
+		t.Error("old orphan should be deleted")
+	}
+	for _, k := range []string{"orphan-young.png", "restore.png", "ok.png", "drop.png", "evicting.png"} {
+		if !e.s3.has(k) {
+			t.Errorf("%s must not be deleted by orphan cleanup", k)
+		}
+	}
+}
+
+func TestNoMigrationWhileIndexLost(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, 1000)
+	e.file(t, "x.png", "xx")
+	_ = e.index.Rebuild(ctx, nil)
+	e.rdb.Del(ctx, e.index.Keys().Epoch)
+
+	if err := e.sched.migrate(ctx, "x.png"); err != nil {
+		t.Fatal(err)
+	}
+	if e.s3.has("x.png") {
+		t.Fatal("must not upload while the index is lost")
+	}
+}
+
+func TestIndexLostMidCommitKeepsObject(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, 1000)
+	e.file(t, "y.png", "yyyy")
+	_ = e.index.Rebuild(ctx, nil)
+	// Redis loses the index between the PG commit and the index write.
+	e.store.onMarkS3 = func(string) { e.rdb.Del(ctx, e.index.Keys().Epoch) }
+
+	if err := e.sched.migrate(ctx, "y.png"); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := e.store.get("y.png"); st != StatusS3 || !e.s3.has("y.png") {
+		t.Fatalf("PG status %q, in s3 %v: must be kept for the rebuild", st, e.s3.has("y.png"))
+	}
+	if err := e.sched.rebuildIndex(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !e.indexed("y.png") {
+		t.Fatal("rebuild must restore y.png")
+	}
+}
+
+func TestRecoversFromFlushAll(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, 1000)
+	e.file(t, "z.png", "zz")
+	e.start(t)
+	eventually(t, "index ready", func() bool { ok, _ := e.index.Initialized(ctx); return ok })
+
+	e.rdb.FlushAll(ctx) // index, heat, stream and consumer group all gone
+	eventually(t, "index rebuilt", func() bool { ok, _ := e.index.Initialized(ctx); return ok })
+	e.hit(t, "z.png", 2)
+	e.hit(t, "z.png", 2)
+	eventually(t, "consumer recovered and migrated", func() bool { return e.indexed("z.png") })
 }

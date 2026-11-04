@@ -2,11 +2,14 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,24 +24,46 @@ import (
 
 type fixture struct {
 	h       *Handler
+	mr      *miniredis.Miniredis
 	rdb     *redis.Client
 	index   *state.Index
 	upHits  chan string
 	dir     string
 	s3Paths map[string]string // path → body served by the fake bucket
+
+	mu       sync.Mutex
+	s3Status int           // if set, the fake bucket answers with this status
+	s3Delay  time.Duration // response delay of the fake bucket
 }
 
-func newFixture(t *testing.T) *fixture {
+func testProxyConfig() config.ProxyConfig {
+	return config.ProxyConfig{
+		TouchInterval: 10 * time.Millisecond, UpstreamTimeout: time.Second,
+		LookupTimeout:         200 * time.Millisecond,
+		RedisBreakerThreshold: 3, RedisBreakerCooldown: 100 * time.Millisecond,
+		S3BreakerThreshold: 3, S3BreakerCooldown: 100 * time.Millisecond,
+	}
+}
+
+func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
 
-	f := &fixture{rdb: rdb, upHits: make(chan string, 16), s3Paths: map[string]string{}, dir: t.TempDir()}
+	f := &fixture{mr: mr, rdb: rdb, upHits: make(chan string, 256), s3Paths: map[string]string{}, dir: t.TempDir()}
 	bucket := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.upHits <- r.URL.Path
 		if r.Header.Get("Cookie") != "" {
 			t.Errorf("cookie leaked to upstream")
+		}
+		f.mu.Lock()
+		status, delay := f.s3Status, f.s3Delay
+		f.mu.Unlock()
+		time.Sleep(delay)
+		if status != 0 {
+			w.WriteHeader(status)
+			return
 		}
 		body, ok := f.s3Paths[r.URL.Path]
 		if !ok {
@@ -59,9 +84,16 @@ func newFixture(t *testing.T) *fixture {
 	t.Cleanup(func() { local.Close() })
 
 	f.index = state.NewIndex(rdb, state.NewKeys("t:"))
+	if err := f.index.Rebuild(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
 	pub := events.NewPublisher(rdb, f.index.Keys().Events, 1000, 64)
 	namer := storage.NewObjectNamer(config.StorageConfig{Prefix: "img", PublicURL: bucket.URL + "/file/bkt"})
-	f.h = New(config.ProxyConfig{TouchInterval: 10 * time.Millisecond, UpstreamTimeout: time.Second}, local, f.index, namer, pub)
+	cfg := testProxyConfig()
+	for _, o := range opts {
+		o(&cfg)
+	}
+	f.h = New(cfg, local, f.index, namer, pub)
 	t.Cleanup(func() { f.h.Close(context.Background()) })
 	return f
 }
@@ -191,5 +223,163 @@ func TestRedisDownServesLocal(t *testing.T) {
 	resp := f.get(t, "/x.png")
 	if resp.StatusCode != 200 || body(t, resp) != "px" {
 		t.Fatalf("unexpected response %d", resp.StatusCode)
+	}
+}
+
+func (f *fixture) upstreamCalls() int {
+	n := 0
+	for {
+		select {
+		case <-f.upHits:
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+func TestRedisBreakerSkipsRedisWhileOpen(t *testing.T) {
+	f := newFixture(t)
+	f.writeLocal(t, "p.png", "local")
+	f.s3Paths["/file/bkt/img/p.png"] = "s3"
+	_, _ = f.index.Add(context.Background(), "p.png", 5, time.Now())
+
+	f.mr.SetError("LOADING simulated outage")
+	for range 3 {
+		if tier := f.get(t, "/p.png").Header.Get(TierHeader); tier != "local" {
+			t.Fatalf("tier during outage = %s", tier)
+		}
+	}
+	if f.h.Health()["redis_breaker"] != "open" {
+		t.Fatalf("breaker = %v", f.h.Health())
+	}
+	before := f.mr.CommandCount()
+	for range 10 {
+		f.get(t, "/p.png")
+	}
+	// Only async publisher writes may reach Redis; no lookups while open.
+	if lookups := f.mr.CommandCount() - before; lookups > 2 {
+		t.Fatalf("open breaker still sent %d commands", lookups)
+	}
+
+	f.mr.SetError("")
+	time.Sleep(120 * time.Millisecond) // cooldown → next request probes
+	if tier := f.get(t, "/p.png").Header.Get(TierHeader); tier != "s3" {
+		t.Fatalf("tier after recovery = %s", tier)
+	}
+	if f.h.Health()["redis_breaker"] != "closed" {
+		t.Fatalf("breaker = %v", f.h.Health())
+	}
+}
+
+func TestHungRedisFailsFast(t *testing.T) {
+	// A server that accepts connections and never answers (e.g. Redis stuck / partitioned).
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { c.Close() })
+		}
+	}()
+	hung := redis.NewClient(&redis.Options{Addr: ln.Addr().String(), ContextTimeoutEnabled: true, MaxRetries: 1})
+	t.Cleanup(func() { hung.Close() })
+
+	f := newFixture(t)
+	f.writeLocal(t, "h.png", "local")
+	f.h.index = state.NewIndex(hung, state.NewKeys("t:"))
+
+	start := time.Now()
+	resp := f.get(t, "/h.png")
+	if resp.StatusCode != 200 || resp.Header.Get(TierHeader) != "local" {
+		t.Fatalf("unexpected %d %s", resp.StatusCode, resp.Header.Get(TierHeader))
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("hung redis stalled the request for %s", took)
+	}
+}
+
+func TestS3BreakerBypassesFailingBucket(t *testing.T) {
+	f := newFixture(t)
+	f.writeLocal(t, "q.png", "local")
+	f.s3Paths["/file/bkt/img/q.png"] = "s3"
+	_, _ = f.index.Add(context.Background(), "q.png", 5, time.Now())
+
+	f.mu.Lock()
+	f.s3Status = http.StatusBadGateway
+	f.mu.Unlock()
+	for range 3 {
+		if body(t, f.get(t, "/q.png")) != "local" {
+			t.Fatal("must fall back to local on 5xx")
+		}
+	}
+	if f.upstreamCalls() != 3 || f.h.Health()["s3_breaker"] != "open" {
+		t.Fatalf("breaker = %v", f.h.Health())
+	}
+	for range 10 {
+		if tier := f.get(t, "/q.png").Header.Get(TierHeader); tier != "local" {
+			t.Fatalf("tier while open = %s", tier)
+		}
+	}
+	if n := f.upstreamCalls(); n != 0 {
+		t.Fatalf("open breaker still called upstream %d times", n)
+	}
+	// 5xx must not be treated as a stale index entry.
+	evs := f.waitEvents(t, 1)
+	for _, e := range evs {
+		if e.Stale {
+			t.Fatal("5xx must not emit stale events")
+		}
+	}
+
+	f.mu.Lock()
+	f.s3Status = 0
+	f.mu.Unlock()
+	time.Sleep(120 * time.Millisecond)
+	if tier := f.get(t, "/q.png").Header.Get(TierHeader); tier != "s3" {
+		t.Fatalf("probe tier = %s", tier)
+	}
+	if f.h.Health()["s3_breaker"] != "closed" {
+		t.Fatalf("breaker = %v", f.h.Health())
+	}
+}
+
+func TestS3TimeoutCountsAsFailure(t *testing.T) {
+	f := newFixture(t, func(c *config.ProxyConfig) { c.UpstreamTimeout = 50 * time.Millisecond; c.S3BreakerThreshold = 1 })
+	f.writeLocal(t, "slow.png", "local")
+	f.s3Paths["/file/bkt/img/slow.png"] = "s3"
+	_, _ = f.index.Add(context.Background(), "slow.png", 5, time.Now())
+	f.mu.Lock()
+	f.s3Delay = 300 * time.Millisecond
+	f.mu.Unlock()
+
+	start := time.Now()
+	if body(t, f.get(t, "/slow.png")) != "local" {
+		t.Fatal("timeout must fall back to local")
+	}
+	if took := time.Since(start); took > 250*time.Millisecond {
+		t.Fatalf("waited %s, upstream timeout not applied", took)
+	}
+	if f.h.Health()["s3_breaker"] != "open" {
+		t.Fatalf("breaker = %v", f.h.Health())
+	}
+}
+
+func TestS3NotFoundDoesNotTripBreaker(t *testing.T) {
+	f := newFixture(t)
+	for i := range 5 {
+		key := fmt.Sprintf("nf%d.png", i)
+		f.writeLocal(t, key, "x")
+		_, _ = f.index.Add(context.Background(), key, 1, time.Now())
+		f.get(t, "/"+key)
+	}
+	if f.h.Health()["s3_breaker"] != "closed" {
+		t.Fatal("404s are per-object staleness, not an outage")
 	}
 }

@@ -53,7 +53,7 @@ func Run(ctx context.Context, cfg config.Config, opts ...Option) error {
 		}
 	}
 
-	rdb, err := cache.NewRedis(ctx, cfg.Redis.Addr, cfg.Redis.Password, cfg.Redis.DB)
+	rdb, err := cache.NewRedis(ctx, cfg.Redis)
 	if err != nil {
 		return fmt.Errorf("redis: %w", err)
 	}

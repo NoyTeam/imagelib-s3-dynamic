@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
@@ -52,7 +56,13 @@ type S3 struct {
 }
 
 func NewS3(cfg config.StorageConfig) *S3 {
+	// Bound every phase except the (size-dependent) body transfer, so a hung bucket can't
+	// stall list/delete calls indefinitely. Uploads get their own size-based context timeout.
+	httpClient := awshttp.NewBuildableClient().
+		WithDialerOptions(func(d *net.Dialer) { d.Timeout = 5 * time.Second }).
+		WithTransportOptions(func(t *http.Transport) { t.ResponseHeaderTimeout = 30 * time.Second })
 	client := s3.New(s3.Options{
+		HTTPClient:   httpClient,
 		BaseEndpoint: aws.String(cfg.Endpoint),
 		Region:       cfg.Region,
 		Credentials:  credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
@@ -84,8 +94,38 @@ func (s *S3) Put(ctx context.Context, key string, body io.ReaderAt, size int64, 
 	return nil
 }
 
+// List calls fn for every object under the prefix, with the prefix stripped from keys.
+func (s *S3) List(ctx context.Context, fn func(key string, size int64, modified time.Time) error) error {
+	prefix := ""
+	if s.prefix != "" {
+		prefix = s.prefix + "/"
+	}
+	p := s3.NewListObjectsV2Paginator(s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(prefix),
+	})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("s3 list: %w", err)
+		}
+		for _, o := range page.Contents {
+			key := strings.TrimPrefix(aws.ToString(o.Key), prefix)
+			if key == "" {
+				continue
+			}
+			if err := fn(key, aws.ToInt64(o.Size), aws.ToTime(o.LastModified)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // Delete removes an object. Missing objects are not an error.
 func (s *S3) Delete(ctx context.Context, key string) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.ObjectKey(key)),

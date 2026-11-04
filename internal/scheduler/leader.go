@@ -47,7 +47,7 @@ func (e *Elector) Run(ctx context.Context, lead func(ctx context.Context)) {
 		if ok {
 			slog.Info("acquired scheduler leadership", "id", e.id)
 			e.hold(ctx, lead, interval)
-			slog.Info("released scheduler leadership", "id", e.id)
+			slog.Info("scheduler leadership ended", "id", e.id)
 		}
 		select {
 		case <-ctx.Done():
@@ -83,6 +83,8 @@ func (e *Elector) hold(ctx context.Context, lead func(ctx context.Context), inte
 				rctx, rcancel := context.WithTimeout(context.Background(), 2*time.Second)
 				if err := releaseScript.Run(rctx, e.rdb, []string{e.key}, e.id).Err(); err != nil {
 					slog.Warn("release leadership failed", "err", err)
+				} else {
+					slog.Info("released scheduler leadership lock", "id", e.id)
 				}
 				rcancel()
 			}

@@ -24,3 +24,17 @@ func TestParseSize(t *testing.T) {
 		}
 	}
 }
+
+func TestOrphanDeleteRequiresPrefix(t *testing.T) {
+	t.Setenv("S3_BUCKET", "b")
+	t.Setenv("S3_PUBLIC_URL", "http://x")
+	t.Setenv("RECONCILE_ORPHANS", "delete")
+	t.Setenv("S3_PREFIX", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("delete without prefix must be rejected")
+	}
+	t.Setenv("S3_PREFIX", "cache")
+	if _, err := Load(); err != nil {
+		t.Fatalf("delete with prefix: %v", err)
+	}
+}

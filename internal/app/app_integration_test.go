@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -31,6 +32,7 @@ import (
 	"imagelib-s3-dynamic/internal/config"
 	"imagelib-s3-dynamic/internal/proxy"
 	"imagelib-s3-dynamic/internal/state"
+	"imagelib-s3-dynamic/internal/storage"
 )
 
 func env(key, def string) string {
@@ -119,7 +121,7 @@ func newHarness(t *testing.T) *harness {
 			Database:  dsn,
 			DBPush:    config.DBPushConfig{Enabled: true},
 			LocalPath: dir,
-			Redis:     config.RedisConfig{Addr: env("IT_REDIS_ADDR", "localhost:56379"), Prefix: prefix},
+			Redis:     config.RedisConfig{Addr: env("IT_REDIS_ADDR", "localhost:56379"), Prefix: prefix, Timeout: time.Second},
 			Storage: config.StorageConfig{
 				Endpoint:       env("IT_S3_ENDPOINT", "http://localhost:59000"),
 				Region:         "us-east-1",
@@ -133,6 +135,9 @@ func newHarness(t *testing.T) *harness {
 			Proxy: config.ProxyConfig{
 				EventBuffer: 1024, StreamMaxLen: 10000,
 				TouchInterval: 100 * time.Millisecond, UpstreamTimeout: 5 * time.Second,
+				LookupTimeout:         200 * time.Millisecond,
+				RedisBreakerThreshold: 5, RedisBreakerCooldown: time.Second,
+				S3BreakerThreshold: 5, S3BreakerCooldown: time.Second,
 			},
 			Scheduler: config.SchedulerConfig{
 				CapacityBytes:      10000, // fits one 6000-byte object + the 3000-byte one
@@ -146,11 +151,21 @@ func newHarness(t *testing.T) *harness {
 				DeleteDelay:        500 * time.Millisecond,
 				StatsFlushInterval: 200 * time.Millisecond,
 				LeaderTTL:          time.Second,
+				IndexCheckInterval: 200 * time.Millisecond,
+				ReconcileInterval:  time.Hour,
+				ReconcileOrphans:   "log",
+				OrphanMinAge:       time.Hour,
 			},
 		},
 	}
 	t.Cleanup(func() {
 		ctx := context.Background()
+		bucket := storage.NewS3(h.base.Storage)
+		var keys []string
+		_ = bucket.List(ctx, func(k string, _ int64, _ time.Time) error { keys = append(keys, k); return nil })
+		for _, k := range keys {
+			_ = bucket.Delete(ctx, k)
+		}
 		var cursor uint64
 		for {
 			ks, next, _ := rdb.Scan(ctx, cursor, prefix+"*", 100).Result()
@@ -361,7 +376,37 @@ func TestEndToEnd(t *testing.T) {
 		}
 	})
 
-	t.Run("index rebuilt from postgres after redis loss", func(t *testing.T) {
+	t.Run("index lost while leading is rebuilt live", func(t *testing.T) {
+		ctx := context.Background()
+		var survivor *instance
+		for _, inst := range []*instance{one, two} {
+			select {
+			case <-inst.done:
+			default:
+				survivor = inst
+			}
+		}
+		h.rdb.Del(ctx, h.keys.Objects, h.keys.LRU, h.keys.Bytes, h.keys.Epoch)
+		eventually(t, "live rebuild", 5*time.Second, func() bool {
+			ok, _ := h.rdb.HExists(ctx, h.keys.Objects, "photos/b.jpg").Result()
+			return ok
+		})
+		if tier := h.get(survivor, "photos/b.jpg"); tier != "s3" {
+			t.Fatalf("b tier after live rebuild = %s", tier)
+		}
+		var hz map[string]string
+		resp, err := http.Get(survivor.url + "/healthz")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&hz)
+		resp.Body.Close()
+		if hz["redis_breaker"] != "closed" || hz["s3_breaker"] != "closed" {
+			t.Fatalf("healthz = %v", hz)
+		}
+	})
+
+	t.Run("partial index loss repaired by reconcile on takeover", func(t *testing.T) {
 		one.stop()
 		two.stop()
 		ctx := context.Background()

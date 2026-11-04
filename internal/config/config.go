@@ -42,7 +42,8 @@ type RedisConfig struct {
 	Addr     string
 	Password string
 	DB       int
-	Prefix   string // key namespace, e.g. "imagelib:"
+	Prefix   string        // key namespace, e.g. "imagelib:"
+	Timeout  time.Duration // dial/read/write timeout of the client
 }
 
 type StorageConfig struct {
@@ -57,10 +58,15 @@ type StorageConfig struct {
 }
 
 type ProxyConfig struct {
-	EventBuffer     int           // in-memory buffer of pending origin events
-	StreamMaxLen    int64         // approximate MAXLEN of the redis event stream
-	TouchInterval   time.Duration // how often S3-hit LRU touches are flushed
-	UpstreamTimeout time.Duration // response header timeout for the S3 public url
+	LookupTimeout         time.Duration // per-request index lookup timeout
+	RedisBreakerThreshold int           // consecutive lookup failures before serving local without asking Redis
+	RedisBreakerCooldown  time.Duration
+	S3BreakerThreshold    int // consecutive S3 failures (5xx/timeout/conn) before bypassing S3
+	S3BreakerCooldown     time.Duration
+	EventBuffer           int           // in-memory buffer of pending origin events
+	StreamMaxLen          int64         // approximate MAXLEN of the redis event stream
+	TouchInterval         time.Duration // how often S3-hit LRU touches are flushed
+	UpstreamTimeout       time.Duration // response header timeout for the S3 public url
 }
 
 type SchedulerConfig struct {
@@ -76,6 +82,10 @@ type SchedulerConfig struct {
 	DeleteDelay        time.Duration // grace period between de-indexing and deleting from S3
 	StatsFlushInterval time.Duration // PG hits/last_access flush interval
 	LeaderTTL          time.Duration // leader lock TTL
+	IndexCheckInterval time.Duration // how often the leader checks the Redis index still exists
+	ReconcileInterval  time.Duration // PG ↔ Redis ↔ S3 reconciliation interval (0 disables)
+	ReconcileOrphans   string        // off | log | delete: S3 objects under the prefix unknown to the index
+	OrphanMinAge       time.Duration // never treat objects younger than this as orphans
 }
 
 func Load() (Config, error) {
@@ -99,6 +109,7 @@ func Load() (Config, error) {
 			Password: os.Getenv("REDIS_PASSWORD"),
 			DB:       p.int("REDIS_DB", 0),
 			Prefix:   getEnv("REDIS_PREFIX", "imagelib:"),
+			Timeout:  p.duration("REDIS_TIMEOUT", time.Second),
 		},
 		Storage: StorageConfig{
 			Endpoint:       getEnv("S3_ENDPOINT", "https://s3.us-west-004.backblazeb2.com"),
@@ -111,10 +122,15 @@ func Load() (Config, error) {
 			ForcePathStyle: p.bool("S3_FORCE_PATH_STYLE", false),
 		},
 		Proxy: ProxyConfig{
-			EventBuffer:     p.int("EVENT_BUFFER", 8192),
-			StreamMaxLen:    int64(p.int("EVENT_STREAM_MAXLEN", 100000)),
-			TouchInterval:   p.duration("LRU_TOUCH_INTERVAL", time.Second),
-			UpstreamTimeout: p.duration("S3_UPSTREAM_TIMEOUT", 10*time.Second),
+			LookupTimeout:         p.duration("REDIS_LOOKUP_TIMEOUT", 100*time.Millisecond),
+			RedisBreakerThreshold: p.int("REDIS_BREAKER_THRESHOLD", 5),
+			RedisBreakerCooldown:  p.duration("REDIS_BREAKER_COOLDOWN", 5*time.Second),
+			S3BreakerThreshold:    p.int("S3_BREAKER_THRESHOLD", 5),
+			S3BreakerCooldown:     p.duration("S3_BREAKER_COOLDOWN", 30*time.Second),
+			EventBuffer:           p.int("EVENT_BUFFER", 8192),
+			StreamMaxLen:          int64(p.int("EVENT_STREAM_MAXLEN", 100000)),
+			TouchInterval:         p.duration("LRU_TOUCH_INTERVAL", time.Second),
+			UpstreamTimeout:       p.duration("S3_UPSTREAM_TIMEOUT", 10*time.Second),
 		},
 		Scheduler: SchedulerConfig{
 			CapacityBytes:      p.size("S3_CAPACITY", "10GiB"),
@@ -129,6 +145,10 @@ func Load() (Config, error) {
 			DeleteDelay:        p.duration("EVICT_DELETE_DELAY", 30*time.Second),
 			StatsFlushInterval: p.duration("STATS_FLUSH_INTERVAL", 10*time.Second),
 			LeaderTTL:          p.duration("LEADER_TTL", 15*time.Second),
+			IndexCheckInterval: p.duration("INDEX_CHECK_INTERVAL", 10*time.Second),
+			ReconcileInterval:  p.duration("RECONCILE_INTERVAL", time.Hour),
+			ReconcileOrphans:   strings.ToLower(getEnv("RECONCILE_ORPHANS", "log")),
+			OrphanMinAge:       p.duration("RECONCILE_ORPHAN_MIN_AGE", time.Hour),
 		},
 	}
 	if p.err != nil {
@@ -156,9 +176,23 @@ func (c Config) validate() error {
 		if c.Scheduler.Workers <= 0 {
 			return fmt.Errorf("MIGRATE_WORKERS must be > 0")
 		}
+		switch c.Scheduler.ReconcileOrphans {
+		case "off", "log", "delete":
+		default:
+			return fmt.Errorf("RECONCILE_ORPHANS must be off|log|delete, got %q", c.Scheduler.ReconcileOrphans)
+		}
+		if c.Scheduler.ReconcileOrphans == "delete" && c.Storage.Prefix == "" {
+			return fmt.Errorf("RECONCILE_ORPHANS=delete requires S3_PREFIX: the prefix must be owned exclusively by this service")
+		}
+		if c.Scheduler.IndexCheckInterval <= 0 {
+			return fmt.Errorf("INDEX_CHECK_INTERVAL must be > 0")
+		}
 		if c.Scheduler.HalfLife <= 0 || c.Scheduler.LeaderTTL < time.Second {
 			return fmt.Errorf("MIGRATE_HALF_LIFE must be > 0 and LEADER_TTL >= 1s")
 		}
+	}
+	if c.Redis.Timeout <= 0 || c.Proxy.LookupTimeout <= 0 {
+		return fmt.Errorf("REDIS_TIMEOUT and REDIS_LOOKUP_TIMEOUT must be > 0")
 	}
 	if c.Proxy.EventBuffer <= 0 || c.Proxy.TouchInterval <= 0 {
 		return fmt.Errorf("EVENT_BUFFER and LRU_TOUCH_INTERVAL must be > 0")

@@ -13,9 +13,10 @@ import (
 )
 
 type Server struct {
-	e   *echo.Echo
-	db  *sql.DB
-	rdb *redis.Client
+	e      *echo.Echo
+	db     *sql.DB
+	rdb    *redis.Client
+	health func() map[string]string // optional extra health details (circuit breakers)
 }
 
 // New builds the HTTP server. images may be nil when the process only runs the scheduler.
@@ -24,6 +25,10 @@ func New(db *sql.DB, rdb *redis.Client, images http.Handler) *Server {
 		e:   echo.New(),
 		db:  db,
 		rdb: rdb,
+	}
+
+	if hp, ok := images.(interface{ Health() map[string]string }); ok {
+		s.health = hp.Health
 	}
 
 	s.e.Use(middleware.Recover())
@@ -54,6 +59,13 @@ func (s *Server) healthz(c *echo.Context) error {
 		status["status"] = "degraded"
 	} else {
 		status["redis"] = "ok"
+	}
+
+	// An open breaker means we are degraded but still serving (from local): report, keep 200.
+	if s.health != nil {
+		for k, v := range s.health() {
+			status[k] = v
+		}
 	}
 
 	code := http.StatusOK

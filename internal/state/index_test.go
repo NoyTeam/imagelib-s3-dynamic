@@ -14,7 +14,11 @@ func newTestIndex(t *testing.T) (*Index, *miniredis.Miniredis) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	t.Cleanup(func() { rdb.Close() })
-	return NewIndex(rdb, NewKeys("t:")), mr
+	idx := NewIndex(rdb, NewKeys("t:"))
+	if err := idx.Rebuild(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	return idx, mr
 }
 
 func TestIndexAddRemoveAccounting(t *testing.T) {
@@ -65,8 +69,8 @@ func TestIndexRebuildAndTrash(t *testing.T) {
 	idx, _ := newTestIndex(t)
 	now := time.Now()
 
-	if ok, _ := idx.Initialized(ctx); ok {
-		t.Fatal("fresh index should not be initialized")
+	if ok, _ := idx.Initialized(ctx); !ok {
+		t.Fatal("rebuilt index should be initialized")
 	}
 	_, _ = idx.Add(ctx, "stale", 999, now)
 	if err := idx.Rebuild(ctx, []Entry{{Key: "x", Size: 10, LastAccess: now}, {Key: "y", Size: 5, LastAccess: now}}); err != nil {
@@ -90,5 +94,41 @@ func TestIndexRebuildAndTrash(t *testing.T) {
 	}
 	if ok, _ := idx.CancelDelete(ctx, "x"); ok {
 		t.Fatal("second cancel x should be a no-op")
+	}
+}
+
+func TestIndexLostRefusesWrites(t *testing.T) {
+	ctx := context.Background()
+	idx, mr := newTestIndex(t)
+	_, _ = idx.Add(ctx, "a", 10, time.Now())
+
+	mr.FlushAll() // Redis lost its data
+	if ok, _ := idx.Initialized(ctx); ok {
+		t.Fatal("flushed index must report not initialized")
+	}
+	if _, err := idx.Add(ctx, "b", 5, time.Now()); err != ErrNotInitialized {
+		t.Fatalf("add on lost index: %v", err)
+	}
+	if _, err := idx.Remove(ctx, "a"); err != ErrNotInitialized {
+		t.Fatalf("remove on lost index: %v", err)
+	}
+	if mr.Exists("t:s3:bytes") {
+		t.Fatal("a refused write must not resurrect the bytes counter")
+	}
+}
+
+func TestIndexRecount(t *testing.T) {
+	ctx := context.Background()
+	idx, mr := newTestIndex(t)
+	_, _ = idx.Add(ctx, "a", 10, time.Now())
+	_, _ = idx.Add(ctx, "b", 5, time.Now())
+	_ = mr.Set("t:s3:bytes", "999") // drift
+
+	before, after, err := idx.Recount(ctx)
+	if err != nil || before != 999 || after != 15 {
+		t.Fatalf("recount = %d → %d, %v", before, after, err)
+	}
+	if total, _ := idx.TotalBytes(ctx); total != 15 {
+		t.Fatalf("total = %d", total)
 	}
 }

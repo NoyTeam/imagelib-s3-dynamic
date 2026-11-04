@@ -5,6 +5,7 @@
 //	s3:objects  HASH   key -> size   membership: object is served from S3
 //	s3:lru      ZSET   key -> last access (unix ms)
 //	s3:bytes    STRING total bytes of indexed objects
+//	s3:epoch    STRING set when the index is (re)built; absent ⇒ index lost, must rebuild
 //	s3:trash    ZSET   key -> delete-after (unix ms), objects de-indexed but not yet deleted
 //	heat        HASH   key -> "score|unixms" decayed hit score
 //	events      STREAM origin (local) read events
@@ -15,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -24,6 +26,7 @@ type Keys struct {
 	Objects string
 	LRU     string
 	Bytes   string
+	Epoch   string
 	Trash   string
 	Heat    string
 	Events  string
@@ -35,6 +38,7 @@ func NewKeys(prefix string) Keys {
 		Objects: prefix + "s3:objects",
 		LRU:     prefix + "s3:lru",
 		Bytes:   prefix + "s3:bytes",
+		Epoch:   prefix + "s3:epoch",
 		Trash:   prefix + "s3:trash",
 		Heat:    prefix + "heat",
 		Events:  prefix + "events",
@@ -61,7 +65,19 @@ func (i *Index) Contains(ctx context.Context, key string) (bool, error) {
 	return n, err
 }
 
+// ErrNotInitialized is returned by writes while the index is lost (e.g. Redis was flushed).
+// Writing then would make a partial index look valid; the leader rebuilds it from PG instead.
+var ErrNotInitialized = errors.New("s3 index not initialized")
+
+func mapScriptErr(err error) error {
+	if err != nil && strings.Contains(err.Error(), "NOINDEX") {
+		return ErrNotInitialized
+	}
+	return err
+}
+
 var addScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[4]) == 0 then return redis.error_reply('NOINDEX') end
 if redis.call('HSETNX', KEYS[1], ARGV[1], ARGV[2]) == 1 then
   redis.call('INCRBY', KEYS[3], ARGV[2])
 end
@@ -71,11 +87,13 @@ return tonumber(redis.call('GET', KEYS[3]) or '0')
 
 // Add atomically indexes key with size and returns the new total bytes.
 func (i *Index) Add(ctx context.Context, key string, size int64, at time.Time) (int64, error) {
-	return addScript.Run(ctx, i.rdb, []string{i.keys.Objects, i.keys.LRU, i.keys.Bytes},
+	n, err := addScript.Run(ctx, i.rdb, []string{i.keys.Objects, i.keys.LRU, i.keys.Bytes, i.keys.Epoch},
 		key, size, at.UnixMilli()).Int64()
+	return n, mapScriptErr(err)
 }
 
 var removeScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[4]) == 0 then return redis.error_reply('NOINDEX') end
 local s = redis.call('HGET', KEYS[1], ARGV[1])
 redis.call('ZREM', KEYS[2], ARGV[1])
 if not s then return -1 end
@@ -86,7 +104,8 @@ return tonumber(s)
 
 // Remove atomically de-indexes key. It returns the size that was freed, or -1 if absent.
 func (i *Index) Remove(ctx context.Context, key string) (int64, error) {
-	return removeScript.Run(ctx, i.rdb, []string{i.keys.Objects, i.keys.LRU, i.keys.Bytes}, key).Int64()
+	n, err := removeScript.Run(ctx, i.rdb, []string{i.keys.Objects, i.keys.LRU, i.keys.Bytes, i.keys.Epoch}, key).Int64()
+	return n, mapScriptErr(err)
 }
 
 // TotalBytes returns the indexed size total.
@@ -98,10 +117,65 @@ func (i *Index) TotalBytes(ctx context.Context) (int64, error) {
 	return n, err
 }
 
-// Initialized reports whether the index has been built (the bytes counter exists).
+// Initialized reports whether the index has been built and not lost since.
 func (i *Index) Initialized(ctx context.Context) (bool, error) {
-	n, err := i.rdb.Exists(ctx, i.keys.Bytes).Result()
+	n, err := i.rdb.Exists(ctx, i.keys.Epoch).Result()
 	return n == 1, err
+}
+
+// Size returns the indexed size of key, or -1 if it is not indexed.
+func (i *Index) Size(ctx context.Context, key string) (int64, error) {
+	n, err := i.rdb.HGet(ctx, i.keys.Objects, key).Int64()
+	if errors.Is(err, redis.Nil) {
+		return -1, nil
+	}
+	return n, err
+}
+
+// All returns every indexed key with its size.
+func (i *Index) All(ctx context.Context) (map[string]int64, error) {
+	out := make(map[string]int64)
+	var cursor uint64
+	for {
+		kv, next, err := i.rdb.HScan(ctx, i.keys.Objects, cursor, "", 1000).Result()
+		if err != nil {
+			return nil, err
+		}
+		for j := 0; j+1 < len(kv); j += 2 {
+			n, _ := strconv.ParseInt(kv[j+1], 10, 64)
+			out[kv[j]] = n
+		}
+		if cursor = next; cursor == 0 {
+			return out, nil
+		}
+	}
+}
+
+var recountScript = redis.NewScript(`
+if redis.call('EXISTS', KEYS[3]) == 0 then return redis.error_reply('NOINDEX') end
+local total = 0
+for _, v in ipairs(redis.call('HVALS', KEYS[1])) do total = total + tonumber(v) end
+local old = tonumber(redis.call('GET', KEYS[2]) or '0')
+if old ~= total then redis.call('SET', KEYS[2], total) end
+return {old, total}
+`)
+
+// Recount atomically recomputes the bytes counter from the object sizes.
+func (i *Index) Recount(ctx context.Context) (before, after int64, err error) {
+	res, err := recountScript.Run(ctx, i.rdb, []string{i.keys.Objects, i.keys.Bytes, i.keys.Epoch}).Int64Slice()
+	if err != nil {
+		return 0, 0, mapScriptErr(err)
+	}
+	return res[0], res[1], nil
+}
+
+// InTrash reports whether key is waiting for deletion.
+func (i *Index) InTrash(ctx context.Context, key string) (bool, error) {
+	_, err := i.rdb.ZScore(ctx, i.keys.Trash, key).Result()
+	if errors.Is(err, redis.Nil) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // Oldest returns up to n least recently used keys.
@@ -160,6 +234,7 @@ func (i *Index) Rebuild(ctx context.Context, entries []Entry) error {
 			total += e.Size
 		}
 		p.Set(ctx, i.keys.Bytes, strconv.FormatInt(total, 10), 0)
+		p.Set(ctx, i.keys.Epoch, strconv.FormatInt(time.Now().UnixMilli(), 10), 0)
 		return nil
 	})
 	return err

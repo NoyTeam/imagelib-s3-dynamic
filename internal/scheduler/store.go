@@ -22,7 +22,15 @@ type Store interface {
 	markS3(ctx context.Context, key, mimeType string, size int64, at time.Time) error
 	markLocal(ctx context.Context, key string, at time.Time) error
 	listS3(ctx context.Context) ([]state.Entry, error)
+	find(ctx context.Context, key string) (*row, error)
 	flushStats(ctx context.Context, rows map[string]*statRow) error
+}
+
+// row is the subset of an images row the scheduler needs. Size is -1 when unknown.
+type row struct {
+	Status     string
+	Size       int64
+	LastAccess time.Time
 }
 
 // NewPGStore returns a Store backed by PostgreSQL through the generated client.
@@ -51,6 +59,23 @@ func (s pgStore) markLocal(ctx context.Context, key string, at time.Time) error 
 		Set(query.Image.Status.Set(StatusLocal), query.Image.UpdatedAt.Set(at)).
 		DoMany(ctx)
 	return err
+}
+
+func (s pgStore) find(ctx context.Context, key string) (*row, error) {
+	img, err := s.gc.Image.FindUnique(ctx, query.Image.Key.Equals(key))
+	if err != nil || img == nil {
+		return nil, err
+	}
+	r := &row{Status: img.Status, Size: -1, LastAccess: img.UpdatedAt}
+	if img.Size != nil {
+		r.Size = *img.Size
+	}
+	for _, t := range []*time.Time{img.MigratedAt, img.LastAccessAt} {
+		if t != nil && t.After(r.LastAccess) {
+			r.LastAccess = *t
+		}
+	}
+	return r, nil
 }
 
 func (s pgStore) listS3(ctx context.Context) ([]state.Entry, error) {
