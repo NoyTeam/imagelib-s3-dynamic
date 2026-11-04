@@ -60,3 +60,9 @@ func TestLocalOpen(t *testing.T) {
 		t.Fatal("symlink escaping root must be rejected")
 	}
 }
+
+func BenchmarkNormalizeKey(b *testing.B) {
+	for b.Loop() {
+		_, _ = NormalizeKey("/photos/2024/06/some-image-name_1920x1080.jpg")
+	}
+}

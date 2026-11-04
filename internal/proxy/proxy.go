@@ -102,13 +102,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if h.lookup.inS3(r.Context(), key) && h.s3Breaker.Allow() {
-		h.touch.add(key)
-		h.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, key)))
+	if !h.lookup.inS3(r.Context(), key) {
+		h.serveLocal(w, r, key, originRead)
 		return
 	}
-	h.serveLocal(w, r, key, false)
+	h.touch.add(key)
+	if !h.s3Breaker.Allow() {
+		// Already migrated; S3 is just unavailable. Not an origin read: don't feed heat.
+		h.serveLocal(w, r, key, s3Fallback)
+		return
+	}
+	h.rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, key)))
 }
+
+// localMode says why a request is served from local disk, which decides what to report.
+type localMode int
+
+const (
+	originRead    localMode = iota // not in S3: a genuine origin read → heat event
+	s3Fallback                     // in S3 but S3 is failing (5xx/timeout/breaker) → no event
+	staleFallback                  // index says S3 but S3 doesn't have it → stale event
+)
 
 // Health reports circuit breaker states and index cache counters for /healthz.
 func (h *Handler) Health() map[string]string {
@@ -167,15 +181,18 @@ func (h *Handler) upstreamError(w http.ResponseWriter, r *http.Request, err erro
 		h.s3Breaker.Failure() // connection error / timeout (status errors were counted already)
 	}
 	stale := miss != nil && miss.status < 500
+	mode := s3Fallback
 	if stale {
 		// Stop sending this key to S3 from this process until the scheduler has fixed the index.
 		h.lookup.remember(key, false)
+		mode = staleFallback
 	}
 	slog.Warn("s3 upstream failed, falling back to local", "key", key, "err", err, "stale", stale)
-	h.serveLocal(w, r, key, stale)
+	h.serveLocal(w, r, key, mode)
 }
 
-func (h *Handler) serveLocal(w http.ResponseWriter, r *http.Request, key string, stale bool) {
+func (h *Handler) serveLocal(w http.ResponseWriter, r *http.Request, key string, mode localMode) {
+	stale := mode == staleFallback
 	f, info, err := h.local.Open(key)
 	if err != nil {
 		if stale {
@@ -191,9 +208,9 @@ func (h *Handler) serveLocal(w http.ResponseWriter, r *http.Request, key string,
 	}
 	defer f.Close()
 
-	// Fire the origin event before streaming so slow clients don't delay heat tracking.
-	// HEAD requests are not counted as reads.
-	if r.Method == http.MethodGet || stale {
+	// Fire the event before streaming so slow clients don't delay heat tracking.
+	// HEAD requests are not counted as reads; S3 fallbacks are not origin reads.
+	if stale || (mode == originRead && r.Method == http.MethodGet) {
 		h.pub.Submit(events.Event{Key: key, Size: info.Size(), At: h.nowFunc(), Stale: stale})
 	}
 

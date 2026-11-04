@@ -63,6 +63,7 @@ type Scheduler struct {
 	reserved int64
 
 	migrateCh chan migrateJob
+	readBlock time.Duration // XREADGROUP block time (bounds shutdown latency)
 }
 
 type migrateJob struct {
@@ -86,6 +87,7 @@ func New(cfg config.SchedulerConfig, id string, rdb redis.UniversalClient, index
 		busy:      make(map[string]struct{}),
 		backoff:   make(map[string]time.Time),
 		migrateCh: make(chan migrateJob, cfg.Workers*64),
+		readBlock: 2 * time.Second,
 	}
 }
 
@@ -198,7 +200,7 @@ func (s *Scheduler) consume(ctx context.Context) {
 		res, err := s.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group: consumerGroup, Consumer: s.id,
 			Streams: []string{s.keys.Events, ">"},
-			Count:   512, Block: 2 * time.Second,
+			Count:   512, Block: s.readBlock,
 		}).Result()
 		if errors.Is(err, redis.Nil) {
 			continue
@@ -787,4 +789,12 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-ctx.Done():
 	case <-time.After(d):
 	}
+}
+
+// isBusy reports whether key is currently locked by in-flight work (used by tests).
+func (s *Scheduler) isBusy(key string) bool {
+	s.busyMu.Lock()
+	defer s.busyMu.Unlock()
+	_, ok := s.busy[key]
+	return ok
 }

@@ -79,19 +79,39 @@ type Publisher struct {
 	rdb    redis.UniversalClient
 	stream string
 	maxLen int64
+	flush  time.Duration
 	ch     chan Event
 	done   chan struct{}
 	once   sync.Once
 
 	dropped   atomic.Int64
 	published atomic.Int64
+	lastWarn  atomic.Int64 // unix nanos of the last drop warning
 }
 
-func NewPublisher(rdb redis.UniversalClient, stream string, maxLen int64, buffer int) *Publisher {
+const dropWarnEvery = 10 * time.Second
+
+// warnDropped logs at most once per dropWarnEvery, however fast events are being dropped.
+func (p *Publisher) warnDropped(msg string, args ...any) {
+	now := time.Now().UnixNano()
+	last := p.lastWarn.Load()
+	if now-last < int64(dropWarnEvery) || !p.lastWarn.CompareAndSwap(last, now) {
+		return
+	}
+	slog.Warn(msg, append(args, "dropped_total", p.dropped.Load())...)
+}
+
+// NewPublisher starts a publisher. flushInterval is the aggregation window: longer windows
+// merge more reads of the same key into one stream entry (heat latency grows accordingly).
+func NewPublisher(rdb redis.UniversalClient, stream string, maxLen int64, buffer int, flushInterval time.Duration) *Publisher {
+	if flushInterval <= 0 {
+		flushInterval = 100 * time.Millisecond
+	}
 	p := &Publisher{
 		rdb:    rdb,
 		stream: stream,
 		maxLen: maxLen,
+		flush:  flushInterval,
 		ch:     make(chan Event, buffer),
 		done:   make(chan struct{}),
 	}
@@ -104,9 +124,8 @@ func (p *Publisher) Submit(e Event) {
 	select {
 	case p.ch <- e:
 	default:
-		if p.dropped.Add(1)%1000 == 1 {
-			slog.Warn("event buffer full, dropping origin events", "dropped_total", p.dropped.Load())
-		}
+		p.dropped.Add(1)
+		p.warnDropped("event buffer full, dropping origin events")
 	}
 }
 
@@ -124,15 +143,12 @@ func (p *Publisher) Close(ctx context.Context) {
 	}
 }
 
-const (
-	batchKeys     = 256 // distinct keys per flush
-	flushInterval = 100 * time.Millisecond
-)
+const batchKeys = 4096 // flush early once this many distinct keys are pending
 
 func (p *Publisher) loop() {
 	defer close(p.done)
 	pending := make(map[string]*Event, batchKeys)
-	timer := time.NewTimer(flushInterval)
+	timer := time.NewTimer(p.flush)
 	defer timer.Stop()
 
 	flush := func() {
@@ -172,7 +188,7 @@ func (p *Publisher) loop() {
 			}
 		case <-timer.C:
 			flush()
-			timer.Reset(flushInterval)
+			timer.Reset(p.flush)
 		}
 	}
 }
@@ -197,7 +213,7 @@ func (p *Publisher) write(batch []Event) {
 	}
 	if err != nil {
 		p.dropped.Add(reads)
-		slog.Warn("publish origin events failed", "count", reads, "err", err)
+		p.warnDropped("publish origin events failed", "count", reads, "err", err)
 		return
 	}
 	p.published.Add(reads)

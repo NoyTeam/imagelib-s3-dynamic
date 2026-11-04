@@ -66,6 +66,7 @@ type ProxyConfig struct {
 	S3BreakerThreshold    int // consecutive S3 failures (5xx/timeout/conn) before bypassing S3
 	S3BreakerCooldown     time.Duration
 	EventBuffer           int           // in-memory buffer of pending origin events
+	EventFlush            time.Duration // per-key aggregation window before writing to the stream
 	StreamMaxLen          int64         // approximate MAXLEN of the redis event stream
 	TouchInterval         time.Duration // how often S3-hit LRU touches are flushed
 	UpstreamTimeout       time.Duration // response header timeout for the S3 public url
@@ -132,6 +133,7 @@ func Load() (Config, error) {
 			S3BreakerThreshold:    p.int("S3_BREAKER_THRESHOLD", 5),
 			S3BreakerCooldown:     p.duration("S3_BREAKER_COOLDOWN", 30*time.Second),
 			EventBuffer:           p.int("EVENT_BUFFER", 8192),
+			EventFlush:            p.duration("EVENT_FLUSH_INTERVAL", time.Second),
 			StreamMaxLen:          int64(p.int("EVENT_STREAM_MAXLEN", 100000)),
 			TouchInterval:         p.duration("LRU_TOUCH_INTERVAL", time.Second),
 			UpstreamTimeout:       p.duration("S3_UPSTREAM_TIMEOUT", 10*time.Second),

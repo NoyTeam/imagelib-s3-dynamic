@@ -19,10 +19,12 @@ import (
 )
 
 type fakeS3 struct {
-	mu       sync.Mutex
-	objects  map[string]string
-	modified map[string]time.Time
-	deletes  []string
+	onPut     func(key string) // test hook, runs after the body was read
+	deleteErr error            // if set, Delete fails
+	mu        sync.Mutex
+	objects   map[string]string
+	modified  map[string]time.Time
+	deletes   []string
 }
 
 func (f *fakeS3) Put(_ context.Context, key string, body io.ReaderAt, size int64, _ string) error {
@@ -34,6 +36,9 @@ func (f *fakeS3) Put(_ context.Context, key string, body io.ReaderAt, size int64
 	f.objects[key] = string(b)
 	f.modified[key] = time.Now()
 	f.mu.Unlock()
+	if f.onPut != nil {
+		f.onPut(key)
+	}
 	return nil
 }
 
@@ -66,6 +71,10 @@ func (f *fakeS3) putAt(key, body string, at time.Time) {
 
 func (f *fakeS3) Delete(_ context.Context, key string) error {
 	f.mu.Lock()
+	if f.deleteErr != nil {
+		f.mu.Unlock()
+		return f.deleteErr
+	}
 	delete(f.objects, key)
 	f.deletes = append(f.deletes, key)
 	f.mu.Unlock()
@@ -80,11 +89,12 @@ func (f *fakeS3) has(key string) bool {
 }
 
 type fakeStore struct {
-	onMarkS3 func(key string) // test hook, runs before the write
-	mu       sync.Mutex
-	status   map[string]string
-	sizes    map[string]int64
-	hits     map[string]int64
+	onMarkS3  func(key string) // test hook, runs before the write
+	markS3Err error
+	mu        sync.Mutex
+	status    map[string]string
+	sizes     map[string]int64
+	hits      map[string]int64
 }
 
 func (f *fakeStore) set(key, status string, size int64) {
@@ -97,6 +107,9 @@ func (f *fakeStore) set(key, status string, size int64) {
 func (f *fakeStore) markS3(_ context.Context, key, _ string, size int64, _ time.Time) error {
 	if f.onMarkS3 != nil {
 		f.onMarkS3(key)
+	}
+	if f.markS3Err != nil {
+		return f.markS3Err
 	}
 	f.set(key, StatusS3, size)
 	return nil
@@ -193,6 +206,7 @@ func newEnv(t *testing.T, capacity int64, opts ...func(*config.SchedulerConfig))
 		o(&cfg)
 	}
 	e.sched = New(cfg, "test", rdb, e.index, local, e.s3, e.store)
+	e.sched.readBlock = 50 * time.Millisecond
 	return e
 }
 

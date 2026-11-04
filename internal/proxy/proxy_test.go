@@ -37,6 +37,30 @@ type fixture struct {
 	mu       sync.Mutex
 	s3Status int           // if set, the fake bucket answers with this status
 	s3Delay  time.Duration // response delay of the fake bucket
+	lastUp   *http.Request // last request seen by the fake bucket
+}
+
+func (f *fixture) setS3(path, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if body == "" {
+		delete(f.s3Paths, path)
+		return
+	}
+	f.s3Paths[path] = body
+}
+
+func (f *fixture) lastUpstream() *http.Request {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastUp
+}
+
+// do serves an arbitrary request through the handler.
+func (f *fixture) do(req *http.Request) *http.Response {
+	rec := httptest.NewRecorder()
+	f.h.ServeHTTP(rec, req)
+	return rec.Result()
 }
 
 func testProxyConfig() config.ProxyConfig {
@@ -67,13 +91,14 @@ func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 		}
 		f.mu.Lock()
 		status, delay := f.s3Status, f.s3Delay
+		f.lastUp = r.Clone(context.Background())
+		body, ok := f.s3Paths[r.URL.Path]
 		f.mu.Unlock()
 		time.Sleep(delay)
 		if status != 0 {
 			w.WriteHeader(status)
 			return
 		}
-		body, ok := f.s3Paths[r.URL.Path]
 		if !ok {
 			http.NotFound(w, r)
 			return
@@ -95,7 +120,7 @@ func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 	if err := f.index.Rebuild(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	pub := events.NewPublisher(rdb, f.index.Keys().Events, 1000, 64)
+	pub := events.NewPublisher(rdb, f.index.Keys().Events, 1000, 64, 50*time.Millisecond)
 	namer := storage.NewObjectNamer(config.StorageConfig{Prefix: "img", PublicURL: bucket.URL + "/file/bkt"})
 	cfg := testProxyConfig()
 	for _, o := range opts {
@@ -338,12 +363,11 @@ func TestS3BreakerBypassesFailingBucket(t *testing.T) {
 	if n := f.upstreamCalls(); n != 0 {
 		t.Fatalf("open breaker still called upstream %d times", n)
 	}
-	// 5xx must not be treated as a stale index entry.
-	evs := f.waitEvents(t, 1)
-	for _, e := range evs {
-		if e.Stale {
-			t.Fatal("5xx must not emit stale events")
-		}
+	// Already-migrated objects served locally because S3 fails are not origin reads:
+	// no heat events, and in particular no stale events.
+	time.Sleep(150 * time.Millisecond)
+	if n, _ := f.rdb.XLen(context.Background(), f.index.Keys().Events).Result(); n != 0 {
+		t.Fatalf("S3 fallbacks must not emit events, got %d", n)
 	}
 
 	f.mu.Lock()

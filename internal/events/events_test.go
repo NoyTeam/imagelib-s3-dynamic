@@ -13,7 +13,7 @@ func TestPublisherAggregatesPerKey(t *testing.T) {
 	mr := miniredis.RunT(t)
 	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
 	defer rdb.Close()
-	p := NewPublisher(rdb, "ev", 0, 10000)
+	p := NewPublisher(rdb, "ev", 0, 10000, 100*time.Millisecond)
 
 	now := time.Now()
 	for i := range 1000 {
