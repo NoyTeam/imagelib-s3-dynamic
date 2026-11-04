@@ -8,8 +8,8 @@ hot are copied to a capacity-bounded S3 bucket and served from there via reverse
 Cold objects are evicted by LRU, keeping the bucket within a configured size budget.
 
 ```
-request ─▶ imagelib ─┬─ index says "in S3" ─▶ reverse proxy to the bucket's public URL
-                     └─ otherwise ──────────▶ stream from local disk ─▶ async "origin read" event
+request ─▶ imglib ─┬─ index: "in S3" ─▶ reverse proxy to the bucket's public URL
+                     └─ otherwise ────▶ stream from local disk ─▶ async "origin read" event
                                                                            │
                          leader-elected scheduler ◀────── Redis stream ◀───┘
                          heat ≥ threshold → upload → PG + Redis index
