@@ -8,7 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
+
+	"imagelib-s3-dynamic/internal/metrics"
 )
 
 // Event is emitted every time a request is served from local storage. The publisher merges
@@ -132,6 +135,18 @@ func (p *Publisher) Submit(e Event) {
 // Stats returns published and dropped counts.
 func (p *Publisher) Stats() (published, dropped int64) {
 	return p.published.Load(), p.dropped.Load()
+}
+
+// Collector exports publish/drop counts and the buffer fill level, read at scrape time.
+func (p *Publisher) Collector() prometheus.Collector {
+	return metrics.FuncCollector(
+		metrics.Func{Name: "events_published_total", Help: "Local reads published to the event stream.",
+			Value: func() float64 { return float64(p.published.Load()) }},
+		metrics.Func{Name: "events_dropped_total", Help: "Local reads dropped (buffer full or stream write failed).",
+			Value: func() float64 { return float64(p.dropped.Load()) }},
+		metrics.Func{Name: "event_buffer_queued", Help: "Events waiting in the publisher buffer.", Gauge: true,
+			Value: func() float64 { return float64(len(p.ch)) }},
+	)
 }
 
 // Close flushes buffered events (bounded by ctx) and stops the publisher.

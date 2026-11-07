@@ -19,8 +19,16 @@ type Server struct {
 	health func() map[string]string // optional extra health details (circuit breakers)
 }
 
+// Option configures optional server routes.
+type Option func(*Server)
+
+// WithMetrics serves h (Prometheus text format, scraped by vmagent) on GET /metrics.
+func WithMetrics(h http.Handler) Option {
+	return func(s *Server) { s.e.GET("/metrics", echo.WrapHandler(h)) }
+}
+
 // New builds the HTTP server. images may be nil when the process only runs the scheduler.
-func New(db *sql.DB, rdb *redis.Client, images http.Handler) *Server {
+func New(db *sql.DB, rdb *redis.Client, images http.Handler, opts ...Option) *Server {
 	s := &Server{
 		e:   echo.New(),
 		db:  db,
@@ -36,6 +44,9 @@ func New(db *sql.DB, rdb *redis.Client, images http.Handler) *Server {
 	s.e.GET("/livez", func(c *echo.Context) error {
 		return c.String(http.StatusOK, "ok")
 	})
+	for _, opt := range opts {
+		opt(s)
+	}
 	if images != nil {
 		// Static routes (e.g. /healthz) take precedence over the wildcard.
 		s.e.Any("/*", echo.WrapHandler(images))

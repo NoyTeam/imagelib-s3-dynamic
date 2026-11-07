@@ -22,6 +22,7 @@ import (
 
 	"imagelib-s3-dynamic/internal/config"
 	"imagelib-s3-dynamic/internal/events"
+	"imagelib-s3-dynamic/internal/metrics"
 	"imagelib-s3-dynamic/internal/state"
 	"imagelib-s3-dynamic/internal/storage"
 )
@@ -73,6 +74,7 @@ type migrateJob struct {
 
 func New(cfg config.SchedulerConfig, id string, rdb redis.UniversalClient, index *state.Index,
 	local *storage.Local, s3 Uploader, st Store) *Scheduler {
+	metrics.S3CapacityBytes.Set(float64(cfg.CapacityBytes))
 	return &Scheduler{
 		cfg:       cfg,
 		id:        id,
@@ -93,6 +95,12 @@ func New(cfg config.SchedulerConfig, id string, rdb redis.UniversalClient, index
 
 // Lead runs all scheduler loops until ctx is cancelled (leadership lost or shutdown).
 func (s *Scheduler) Lead(ctx context.Context) {
+	metrics.Leader.Set(1)
+	defer func() {
+		// Runs after every loop stopped. Only the leader keeps these current.
+		metrics.Leader.Set(0)
+		metrics.S3IndexBytes.Set(0)
+	}()
 	if err := s.ensureIndex(ctx); err != nil {
 		slog.Error("index rebuild failed, scheduler not started", "err", err)
 		return
@@ -112,6 +120,7 @@ func (s *Scheduler) Lead(ctx context.Context) {
 	wg.Go(func() { s.trashLoop(ctx) })
 	wg.Go(func() { s.statsLoop(ctx) })
 	wg.Go(func() { s.heatGCLoop(ctx) })
+	wg.Go(func() { s.metricsLoop(ctx) })
 	s.consume(ctx)
 	wg.Wait()
 }
@@ -409,6 +418,7 @@ func (s *Scheduler) heatGCLoop(ctx context.Context) {
 		case <-tick.C:
 		}
 		removed, err := s.gcHeat(ctx)
+		metrics.HeatGCRemoved.Add(float64(removed))
 		if err != nil && ctx.Err() == nil {
 			slog.Warn("heat gc failed", "err", err)
 		}
@@ -520,49 +530,72 @@ func (s *Scheduler) worker(ctx context.Context) {
 	}
 }
 
+// migrate migrates key and records the outcome in the migration metrics.
 func (s *Scheduler) migrate(ctx context.Context, key string) error {
+	size, took, err := s.migrateObject(ctx, key)
+	switch {
+	case errors.Is(err, errNoSpace):
+		metrics.Migrations.WithLabelValues(metrics.MigrationDeferred).Inc()
+	case err != nil:
+		if ctx.Err() == nil { // not just leadership loss / shutdown
+			metrics.Migrations.WithLabelValues(metrics.MigrationFailure).Inc()
+		}
+	case size > 0:
+		metrics.Migrations.WithLabelValues(metrics.MigrationSuccess).Inc()
+		metrics.MigrationBytes.Add(float64(size))
+		metrics.MigrationDuration.Observe(took.Seconds())
+	default:
+		metrics.Migrations.WithLabelValues(metrics.MigrationSkipped).Inc()
+	}
+	return err
+}
+
+// migrateObject returns the uploaded size (0 when there was nothing to do) and how long
+// upload + commit took.
+func (s *Scheduler) migrateObject(ctx context.Context, key string) (int64, time.Duration, error) {
 	// While the index is lost "not indexed" means nothing; wait for the rebuild.
 	if ok, err := s.index.Initialized(ctx); err != nil || !ok {
-		return err
+		return 0, 0, err
 	}
 	if ok, err := s.index.Contains(ctx, key); err != nil || ok {
-		return err
+		return 0, 0, err
 	}
 	f, info, err := s.local.Open(key)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+		return 0, 0, nil
 	}
 	if err != nil {
-		return err
+		return 0, 0, err
 	}
 	defer f.Close()
 	size := info.Size()
 	if !s.sizeEligible(size) {
-		return nil
+		return 0, 0, nil
 	}
 
 	if err := s.reserve(ctx, size); err != nil {
-		return err
+		return 0, 0, err
 	}
 	defer s.release(size)
 
 	// A previous copy may be waiting in the trash; we are about to overwrite it.
 	if _, err := s.index.CancelDelete(ctx, key); err != nil {
-		return err
+		return 0, 0, err
 	}
 
 	contentType := storage.DetectContentType(key, f)
 	start := s.now()
+	timer := time.Now()
 	upCtx, cancel := context.WithTimeout(ctx, uploadTimeout(size))
 	defer cancel()
 	if err := s.s3.Put(upCtx, key, f, size, contentType); err != nil {
-		return err
+		return 0, 0, err
 	}
 
 	// The local file must not have changed while uploading.
 	if after, err := f.Stat(); err != nil || after.Size() != size || !after.ModTime().Equal(info.ModTime()) {
 		s.deleteQuietly(key)
-		return errors.New("local file changed during upload")
+		return 0, 0, errors.New("local file changed during upload")
 	}
 
 	s.indexMu.RLock()
@@ -570,14 +603,14 @@ func (s *Scheduler) migrate(ctx context.Context, key string) error {
 	now := s.now()
 	if err := s.store.markS3(ctx, key, contentType, size, now); err != nil {
 		s.deleteQuietly(key)
-		return err
+		return 0, 0, err
 	}
 	total, err := s.index.Add(ctx, key, size, now)
 	if errors.Is(err, state.ErrNotInitialized) {
 		// Index was lost mid-commit. PG already says s3 and the object is uploaded, which is
 		// exactly what the pending rebuild (blocked on indexMu until we return) will restore.
 		slog.Warn("index lost during migration commit; rebuild will restore it", "key", key)
-		return nil
+		return size, time.Since(timer), nil
 	}
 	if err != nil {
 		// Roll PG back so it never claims an object Redis doesn't serve.
@@ -585,11 +618,12 @@ func (s *Scheduler) migrate(ctx context.Context, key string) error {
 		defer c()
 		_ = s.store.markLocal(bg, key, now)
 		s.deleteQuietly(key)
-		return err
+		return 0, 0, err
 	}
+	metrics.S3IndexBytes.Set(float64(total))
 	slog.Info("migrated to s3", "key", key, "size", size, "took", s.now().Sub(start).Round(time.Millisecond),
 		"s3_bytes", total, "capacity", s.cfg.CapacityBytes)
-	return nil
+	return size, time.Since(timer), nil
 }
 
 func uploadTimeout(size int64) time.Duration {
@@ -621,6 +655,7 @@ func (s *Scheduler) handleStale(ctx context.Context, key string) {
 	if freed < 0 {
 		return
 	}
+	metrics.StaleIndexRemovals.Inc()
 	if err := s.store.markLocal(ctx, key, s.now()); err != nil {
 		slog.Warn("mark stale object local failed", "key", key, "err", err)
 	}
@@ -642,6 +677,7 @@ func (s *Scheduler) reserve(ctx context.Context, size int64) error {
 		if err != nil {
 			return err
 		}
+		metrics.S3IndexBytes.Set(float64(total))
 		if total+s.reserved+size <= s.cfg.CapacityBytes {
 			s.reserved += size
 			return nil
@@ -673,6 +709,7 @@ func (s *Scheduler) enforce(ctx context.Context) {
 			slog.Warn("capacity check failed", "err", err)
 			return
 		}
+		metrics.S3IndexBytes.Set(float64(total))
 		if total+s.reserved <= s.cfg.CapacityBytes {
 			break
 		}
@@ -724,6 +761,10 @@ func (s *Scheduler) evict(ctx context.Context, key string) error {
 	now := s.now()
 	if err := s.index.ScheduleDelete(ctx, key, now.Add(s.cfg.DeleteDelay)); err != nil {
 		return err
+	}
+	if freed >= 0 {
+		metrics.Evictions.Inc()
+		metrics.EvictionBytes.Add(float64(freed))
 	}
 	if err := s.store.markLocal(ctx, key, now); err != nil {
 		slog.Warn("mark evicted object local failed", "key", key, "err", err)
@@ -802,9 +843,12 @@ func (s *Scheduler) drainTrash(ctx context.Context) (int, error) {
 				return
 			}
 			if err := s.s3.Delete(ctx, key); err != nil {
+				s3DeleteFailure.Inc()
 				slog.Warn("s3 delete failed, retrying later", "key", key, "err", err)
 				_ = s.index.ScheduleDelete(ctx, key, s.now().Add(time.Minute))
+				return
 			}
+			s3DeleteSuccess.Inc()
 		})
 	}
 	wg.Wait()
@@ -832,6 +876,54 @@ func (s *Scheduler) statsLoop(ctx context.Context) {
 			return
 		case <-tick.C:
 			flush(ctx)
+		}
+	}
+}
+
+var (
+	s3DeleteSuccess = metrics.S3Deletes.WithLabelValues("success")
+	s3DeleteFailure = metrics.S3Deletes.WithLabelValues("failure")
+)
+
+// metricsInterval is how often the leader samples saturation gauges and the stream lag.
+const metricsInterval = 10 * time.Second
+
+// metricsLoop periodically samples scheduler gauges; they are reset when leadership ends so
+// a former leader doesn't keep reporting stale values.
+func (s *Scheduler) metricsLoop(ctx context.Context) {
+	defer func() {
+		metrics.MigrateQueueDepth.Set(0)
+		metrics.BusyKeys.Set(0)
+		metrics.BackoffKeys.Set(0)
+		metrics.EventsLag.Set(0)
+	}()
+	tick := time.NewTicker(metricsInterval)
+	defer tick.Stop()
+	for {
+		s.sampleMetrics(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+func (s *Scheduler) sampleMetrics(ctx context.Context) {
+	metrics.MigrateQueueDepth.Set(float64(len(s.migrateCh)))
+	s.busyMu.Lock()
+	busy, backoff := len(s.busy), len(s.backoff)
+	s.busyMu.Unlock()
+	metrics.BusyKeys.Set(float64(busy))
+	metrics.BackoffKeys.Set(float64(backoff))
+
+	groups, err := s.rdb.XInfoGroups(ctx, s.keys.Events).Result()
+	if err != nil {
+		return
+	}
+	for _, g := range groups {
+		if g.Name == consumerGroup && g.Lag >= 0 { // -1: Redis can't determine it
+			metrics.EventsLag.Set(float64(g.Lag))
 		}
 	}
 }

@@ -8,9 +8,11 @@ import (
 	"time"
 
 	"github.com/dgraph-io/ristretto/v2"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/sync/singleflight"
 
 	"imagelib-s3-dynamic/internal/breaker"
+	"imagelib-s3-dynamic/internal/metrics"
 	"imagelib-s3-dynamic/internal/state"
 )
 
@@ -31,6 +33,7 @@ type indexLookup struct {
 	sf      singleflight.Group
 
 	hits, misses, redisCalls, coalesced atomic.Int64
+	redisErrors, breakerBlocked         atomic.Int64
 }
 
 func newIndexLookup(index *state.Index, br *breaker.Breaker, timeout, ttl time.Duration, maxKeys int64) (*indexLookup, error) {
@@ -66,6 +69,7 @@ func (l *indexLookup) inS3(ctx context.Context, key string) bool {
 		l.misses.Add(1)
 	}
 	if !l.breaker.Allow() {
+		l.breakerBlocked.Add(1)
 		return false
 	}
 	ch := l.sf.DoChan(key, func() (any, error) {
@@ -93,6 +97,7 @@ func (l *indexLookup) fetch(key string) (bool, error) {
 	defer cancel()
 	v, err := l.index.Contains(ctx, key)
 	if err != nil {
+		l.redisErrors.Add(1)
 		l.breaker.Failure()
 		slog.Warn("index lookup failed, serving local", "key", key, "err", err)
 		return false, err
@@ -106,6 +111,19 @@ func (l *indexLookup) remember(key string, inS3 bool) {
 	if l.cache != nil {
 		l.cache.SetWithTTL(key, inS3, 1, l.ttl)
 	}
+}
+
+// collector exports the lookup counters; they are read at scrape time only.
+func (l *indexLookup) collector() prometheus.Collector {
+	load := func(v *atomic.Int64) func() float64 { return func() float64 { return float64(v.Load()) } }
+	return metrics.FuncCollector(
+		metrics.Func{Name: "index_cache_hits_total", Help: "Index lookups answered by the in-process cache.", Value: load(&l.hits)},
+		metrics.Func{Name: "index_cache_misses_total", Help: "Index lookups not found in the in-process cache.", Value: load(&l.misses)},
+		metrics.Func{Name: "index_redis_lookups_total", Help: "Index lookups that reached Redis.", Value: load(&l.redisCalls)},
+		metrics.Func{Name: "index_redis_errors_total", Help: "Failed Redis index lookups.", Value: load(&l.redisErrors)},
+		metrics.Func{Name: "index_lookups_coalesced_total", Help: "Concurrent index lookups merged by singleflight.", Value: load(&l.coalesced)},
+		metrics.Func{Name: "index_breaker_blocked_total", Help: "Index lookups skipped (served local) because the Redis breaker was open.", Value: load(&l.breakerBlocked)},
+	)
 }
 
 func (l *indexLookup) stats() map[string]string {

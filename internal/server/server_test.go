@@ -130,3 +130,26 @@ func TestImageRoutesAndSchedulerOnlyMode(t *testing.T) {
 	}
 	_ = context.Background()
 }
+
+func TestMetricsRoute(t *testing.T) {
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+
+	images := &stubImages{}
+	metricsHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("go_goroutines 1\n"))
+	})
+	s := New(unreachablePG(t), rdb, images, WithMetrics(metricsHandler))
+	rec := httptest.NewRecorder()
+	s.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "go_goroutines 1\n" || images.calls != 0 {
+		t.Fatalf("/metrics: %d %q (image handler calls %d)", rec.Code, rec.Body.String(), images.calls)
+	}
+	// Only the exact path is reserved.
+	rec = httptest.NewRecorder()
+	s.e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics/x.png", nil))
+	if rec.Body.String() != "image:/metrics/x.png" {
+		t.Fatalf("/metrics/x.png routed to %q", rec.Body.String())
+	}
+}

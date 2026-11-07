@@ -12,10 +12,13 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 
 	"imagelib-s3-dynamic/internal/config"
 	"imagelib-s3-dynamic/internal/events"
+	"imagelib-s3-dynamic/internal/metrics"
 	"imagelib-s3-dynamic/internal/state"
 	"imagelib-s3-dynamic/internal/storage"
 )
@@ -547,4 +550,54 @@ func TestRecoversFromFlushAll(t *testing.T) {
 	e.hit(t, "z.png", 2)
 	e.hit(t, "z.png", 2)
 	eventually(t, "consumer recovered and migrated", func() bool { return e.indexed("z.png") })
+}
+
+func TestSchedulerMetrics(t *testing.T) {
+	val := func(c prometheus.Collector) float64 { return testutil.ToFloat64(c) }
+	success := metrics.Migrations.WithLabelValues(metrics.MigrationSuccess)
+	skipped := metrics.Migrations.WithLabelValues(metrics.MigrationSkipped)
+	succ0, skip0, bytes0, ev0, evb0 := val(success), val(skipped), val(metrics.MigrationBytes), val(metrics.Evictions), val(metrics.EvictionBytes)
+	del0 := val(metrics.S3Deletes.WithLabelValues("success"))
+
+	e := newEnv(t, 10) // room for one 6-byte object only
+	if v := val(metrics.S3CapacityBytes); v != 10 {
+		t.Fatalf("capacity gauge = %v", v)
+	}
+	e.file(t, "a.png", "aaaaaa")
+	e.file(t, "b.png", "bbbbbb")
+	e.start(t)
+	eventually(t, "leader gauge", func() bool { return val(metrics.Leader) == 1 })
+
+	e.hit(t, "a.png", 6)
+	e.hit(t, "a.png", 6)
+	eventually(t, "a migrated", func() bool { return e.indexed("a.png") })
+	e.hit(t, "b.png", 6)
+	e.hit(t, "b.png", 6)
+	eventually(t, "b migrated", func() bool { return e.indexed("b.png") })
+	eventually(t, "a deleted from s3", func() bool { return !e.s3.has("a.png") })
+	eventually(t, "delete counted", func() bool { return val(metrics.S3Deletes.WithLabelValues("success"))-del0 == 1 })
+
+	if d := val(success) - succ0; d != 2 {
+		t.Errorf("success migrations = %v", d)
+	}
+	if d := val(metrics.MigrationBytes) - bytes0; d != 12 {
+		t.Errorf("migrated bytes = %v", d)
+	}
+	if d := val(metrics.Evictions) - ev0; d != 1 {
+		t.Errorf("evictions = %v", d)
+	}
+	if d := val(metrics.EvictionBytes) - evb0; d != 6 {
+		t.Errorf("evicted bytes = %v", d)
+	}
+	if v := val(metrics.S3IndexBytes); v != 6 {
+		t.Errorf("index bytes gauge = %v", v)
+	}
+
+	// Already migrated → skipped.
+	if err := e.sched.migrate(context.Background(), "b.png"); err != nil {
+		t.Fatal(err)
+	}
+	if d := val(skipped) - skip0; d != 1 {
+		t.Errorf("skipped migrations = %v", d)
+	}
 }

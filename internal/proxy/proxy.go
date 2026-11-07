@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -20,9 +21,12 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"imagelib-s3-dynamic/internal/breaker"
 	"imagelib-s3-dynamic/internal/config"
 	"imagelib-s3-dynamic/internal/events"
+	"imagelib-s3-dynamic/internal/metrics"
 	"imagelib-s3-dynamic/internal/state"
 	"imagelib-s3-dynamic/internal/storage"
 )
@@ -67,6 +71,13 @@ func New(cfg config.ProxyConfig, local *storage.Local, index *state.Index, namer
 		touch:        newToucher(index, cfg.TouchInterval),
 		nowFunc:      time.Now,
 	}
+	for _, b := range []struct {
+		name string
+		br   *breaker.Breaker
+	}{{"redis-index", redisBreaker}, {"s3-upstream", h.s3Breaker}} {
+		g := metrics.BreakerState.WithLabelValues(b.name)
+		b.br.OnStateChange(func(s breaker.State) { g.Set(float64(s)) })
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = cfg.UpstreamTimeout
@@ -90,7 +101,49 @@ func (h *Handler) Close(ctx context.Context) {
 	h.lookup.close()
 }
 
+// Collector exports the index lookup and event publisher counters for /metrics.
+func (h *Handler) Collector() prometheus.Collector {
+	return collectors{h.lookup.collector(), h.pub.Collector()}
+}
+
+type collectors []prometheus.Collector
+
+func (c collectors) Describe(ch chan<- *prometheus.Desc) {
+	for _, x := range c {
+		x.Describe(ch)
+	}
+}
+
+func (c collectors) Collect(ch chan<- prometheus.Metric) {
+	for _, x := range c {
+		x.Collect(ch)
+	}
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	mw := &meteredWriter{ResponseWriter: w}
+	// Deferred: ReverseProxy aborts a broken stream (client gone, upstream cut) by panicking
+	// with http.ErrAbortHandler; those partial responses must still be counted.
+	defer h.observe(mw, r, time.Now())
+	h.serve(mw, r)
+}
+
+func (h *Handler) observe(mw *meteredWriter, r *http.Request, start time.Time) {
+	code := mw.code
+	if code == 0 {
+		code = http.StatusOK // net/http's implicit status for an empty response
+		if r.Context().Err() != nil {
+			code = 499 // client went away before anything was written
+		}
+	}
+	tier := metrics.TierLocal
+	if mw.Header().Get(TierHeader) == metrics.TierS3 {
+		tier = metrics.TierS3
+	}
+	metrics.ObserveRequest(tier, code, mw.bytes, time.Since(start))
+}
+
+func (h *Handler) serve(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -150,6 +203,7 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	// 404/403/… are per-object (stale index) problems, not an S3 outage.
 	if resp.StatusCode >= 500 {
 		h.s3Breaker.Failure()
+		metrics.S3UpstreamErrors.WithLabelValues(metrics.UpstreamServerError).Inc()
 	} else {
 		h.s3Breaker.Success()
 	}
@@ -159,6 +213,9 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 		resp.StatusCode == http.StatusUnauthorized,
 		resp.StatusCode == http.StatusGone,
 		resp.StatusCode >= 500:
+		if resp.StatusCode < 500 {
+			metrics.S3UpstreamErrors.WithLabelValues(metrics.UpstreamObjectMissing).Inc()
+		}
 		resp.Body.Close()
 		return &upstreamMiss{status: resp.StatusCode}
 	}
@@ -179,6 +236,7 @@ func (h *Handler) upstreamError(w http.ResponseWriter, r *http.Request, err erro
 	var miss *upstreamMiss
 	if !errors.As(err, &miss) {
 		h.s3Breaker.Failure() // connection error / timeout (status errors were counted already)
+		metrics.S3UpstreamErrors.WithLabelValues(metrics.UpstreamTransport).Inc()
 	}
 	stale := miss != nil && miss.status < 500
 	mode := s3Fallback
@@ -192,6 +250,7 @@ func (h *Handler) upstreamError(w http.ResponseWriter, r *http.Request, err erro
 }
 
 func (h *Handler) serveLocal(w http.ResponseWriter, r *http.Request, key string, mode localMode) {
+	localServes[mode].Inc()
 	stale := mode == staleFallback
 	f, info, err := h.local.Open(key)
 	if err != nil {
@@ -222,3 +281,56 @@ func (h *Handler) serveLocal(w http.ResponseWriter, r *http.Request, key string,
 	// ServeContent streams straight from disk and handles Range/HEAD/conditional requests.
 	http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 }
+
+// localServes is indexed by localMode.
+var localServes = [...]prometheus.Counter{
+	originRead:    metrics.LocalServes.WithLabelValues(metrics.LocalOrigin),
+	s3Fallback:    metrics.LocalServes.WithLabelValues(metrics.LocalS3Fallback),
+	staleFallback: metrics.LocalServes.WithLabelValues(metrics.LocalStaleFallback),
+}
+
+// meteredWriter records the status code and body bytes of a response. It forwards
+// io.ReaderFrom (sendfile) and exposes Unwrap for http.ResponseController (flushing).
+type meteredWriter struct {
+	http.ResponseWriter
+	code  int
+	bytes int64
+}
+
+func (w *meteredWriter) WriteHeader(code int) {
+	if w.code == 0 && code >= 200 { // 1xx are informational; the final status follows
+		w.code = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *meteredWriter) Write(b []byte) (int, error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	n, err := w.ResponseWriter.Write(b)
+	w.bytes += int64(n)
+	return n, err
+}
+
+func (w *meteredWriter) ReadFrom(src io.Reader) (n int64, err error) {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	if rf, ok := w.ResponseWriter.(io.ReaderFrom); ok {
+		n, err = rf.ReadFrom(src)
+	} else {
+		n, err = io.Copy(w.ResponseWriter, src)
+	}
+	w.bytes += n
+	return n, err
+}
+
+func (w *meteredWriter) Flush() {
+	if w.code == 0 {
+		w.code = http.StatusOK
+	}
+	_ = http.NewResponseController(w.ResponseWriter).Flush()
+}
+
+func (w *meteredWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }

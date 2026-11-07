@@ -37,6 +37,8 @@ type Breaker struct {
 	cooldown  time.Duration
 	now       func() time.Time
 
+	onChange func(State)
+
 	mu       sync.Mutex
 	state    State
 	failures int
@@ -49,6 +51,29 @@ type Breaker struct {
 // again after cooldown. threshold <= 0 disables the breaker (always allows).
 func New(name string, threshold int, cooldown time.Duration) *Breaker {
 	return &Breaker{name: name, threshold: threshold, cooldown: cooldown, now: time.Now}
+}
+
+// OnStateChange registers fn, called (with the breaker lock held, so it must be cheap and
+// not call back into the breaker) on every state transition. fn is also called once now with
+// the current state. Set it before the breaker is shared.
+func (b *Breaker) OnStateChange(fn func(State)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.onChange = fn
+	if fn != nil {
+		fn(b.state)
+	}
+}
+
+// setState transitions to s. Caller holds mu.
+func (b *Breaker) setState(s State) {
+	if b.state == s {
+		return
+	}
+	b.state = s
+	if b.onChange != nil {
+		b.onChange(s)
+	}
 }
 
 // Allow reports whether a call may proceed. In half-open state only one probe is let
@@ -68,7 +93,7 @@ func (b *Breaker) Allow() bool {
 		if now.Sub(b.openedAt) < b.cooldown {
 			return false
 		}
-		b.state = HalfOpen
+		b.setState(HalfOpen)
 		slog.Info("circuit breaker half-open, probing", "breaker", b.name)
 	case HalfOpen:
 		if b.probing && now.Sub(b.probeAt) < b.cooldown {
@@ -90,7 +115,7 @@ func (b *Breaker) Success() {
 	if b.state != Closed {
 		slog.Info("circuit breaker closed", "breaker", b.name)
 	}
-	b.state = Closed
+	b.setState(Closed)
 	b.failures = 0
 	b.probing = false
 }
@@ -107,7 +132,7 @@ func (b *Breaker) Failure() {
 		if b.state == Closed {
 			slog.Warn("circuit breaker opened", "breaker", b.name, "failures", b.failures, "cooldown", b.cooldown)
 		}
-		b.state = Open
+		b.setState(Open)
 		b.openedAt = b.now()
 		b.probing = false
 	}

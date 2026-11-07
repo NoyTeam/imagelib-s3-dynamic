@@ -37,6 +37,7 @@ type fixture struct {
 	mu       sync.Mutex
 	s3Status int           // if set, the fake bucket answers with this status
 	s3Delay  time.Duration // response delay of the fake bucket
+	s3Cut    bool          // if set, the fake bucket cuts the body after half of it
 	lastUp   *http.Request // last request seen by the fake bucket
 }
 
@@ -90,7 +91,7 @@ func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 			t.Errorf("cookie leaked to upstream")
 		}
 		f.mu.Lock()
-		status, delay := f.s3Status, f.s3Delay
+		status, delay, cut := f.s3Status, f.s3Delay, f.s3Cut
 		f.lastUp = r.Clone(context.Background())
 		body, ok := f.s3Paths[r.URL.Path]
 		f.mu.Unlock()
@@ -106,6 +107,12 @@ func newFixture(t *testing.T, opts ...func(*config.ProxyConfig)) *fixture {
 		w.Header().Set("Set-Cookie", "x=y")
 		w.Header().Set("Cache-Control", "public, max-age=31536000")
 		w.Header().Set("Expires", "Thu, 01 Jan 2099 00:00:00 GMT")
+		if cut { // promise the full length, then drop the connection half-way
+			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			_, _ = io.WriteString(w, body[:len(body)/2])
+			w.(http.Flusher).Flush()
+			panic(http.ErrAbortHandler)
+		}
 		_, _ = io.WriteString(w, body)
 	}))
 	t.Cleanup(bucket.Close)

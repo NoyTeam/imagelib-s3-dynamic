@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"time"
 
+	"imagelib-s3-dynamic/internal/metrics"
 	"imagelib-s3-dynamic/internal/state"
 )
 
@@ -37,6 +38,13 @@ type reconcileReport struct {
 	orphans, orphansDeleted     int
 }
 
+func (rep *reconcileReport) record() {
+	metrics.ReconcileFixes.WithLabelValues(metrics.FixRestored).Add(float64(rep.restored))
+	metrics.ReconcileFixes.WithLabelValues(metrics.FixDropped).Add(float64(rep.dropped))
+	metrics.ReconcileFixes.WithLabelValues(metrics.FixFinished).Add(float64(rep.finished))
+	metrics.ReconcileFixes.WithLabelValues(metrics.FixOrphanDeleted).Add(float64(rep.orphansDeleted))
+}
+
 func (s *Scheduler) reconcile(ctx context.Context) error {
 	// Never let one run (e.g. listing a hung bucket) outlive its interval by much.
 	ctx, cancel := context.WithTimeout(ctx, max(s.cfg.ReconcileInterval, time.Minute))
@@ -46,6 +54,7 @@ func (s *Scheduler) reconcile(ctx context.Context) error {
 	}
 	start := s.now()
 	var rep reconcileReport
+	defer rep.record() // also count fixes of a run that failed half-way
 
 	// 1. PG ↔ Redis index, streamed in pages with one batched lookup per page on the other
 	//    side, so memory and per-command time stay bounded with millions of objects.

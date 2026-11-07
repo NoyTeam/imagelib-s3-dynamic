@@ -372,6 +372,43 @@ correctly from local disk.
 }
 ```
 
+### Metrics
+
+`GET /metrics` exposes Prometheus text-format metrics on the main port for every role
+(scrape it with vmagent or Prometheus). Labels are small fixed sets; object keys are never
+used as labels. The path is reserved like `/healthz`, so an image named `metrics` at the root
+is not reachable; keep the port off the public internet or block `/metrics` at the edge.
+
+```yaml
+# vmagent / Prometheus
+scrape_configs:
+  - job_name: imagelib
+    static_configs:
+      - targets: ["imagelib:8080"]
+```
+
+| Area | Metrics |
+|---|---|
+| Requests | `imagelib_requests_total{tier,code}`, `imagelib_request_bytes_total{tier}`, `imagelib_request_duration_seconds{tier}` (includes client download; `code="499"` = client left before a response) |
+| Index lookup | `imagelib_index_cache_hits_total`, `_cache_misses_total`, `_redis_lookups_total`, `_redis_errors_total`, `_lookups_coalesced_total`, `_breaker_blocked_total` (prefix `imagelib_index`) |
+| S3 / fallback | `imagelib_s3_upstream_errors_total{kind=object_missing\|server_error\|transport}`, `imagelib_local_serves_total{reason=origin\|s3_fallback\|stale_fallback}`, `imagelib_breaker_state{name}` (0 closed, 1 open, 2 half-open) |
+| Events | `imagelib_events_published_total`, `imagelib_events_dropped_total`, `imagelib_event_buffer_queued`, `imagelib_events_lag` (leader) |
+| Scheduler (leader) | `imagelib_leader`, `imagelib_migrations_total{result=success\|failure\|deferred\|skipped}`, `imagelib_migrations_bytes_total`, `imagelib_migration_duration_seconds`, `imagelib_evictions_total`, `imagelib_evictions_bytes_total`, `imagelib_s3_deletes_total{result}`, `imagelib_s3_index_bytes`, `imagelib_s3_capacity_bytes`, `imagelib_migrate_queue_depth`, `imagelib_busy_keys`, `imagelib_backoff_keys`, `imagelib_heat_gc_removed_total`, `imagelib_stale_index_removals_total`, `imagelib_reconcile_fixes_total{kind}` |
+| Runtime | `go_*`, `process_*` |
+
+Useful queries:
+
+```promql
+sum(increase(imagelib_requests_total[1h]))                                   # requests per hour
+sum(rate(imagelib_requests_total{tier="s3"}[5m])) / sum(rate(imagelib_requests_total[5m]))  # S3 offload ratio
+max(imagelib_s3_index_bytes) / max(imagelib_s3_capacity_bytes)               # capacity utilisation
+sum(rate(imagelib_events_dropped_total[5m])) > 0                             # heat data being lost
+sum(rate(imagelib_local_serves_total{reason="stale_fallback"}[5m])) > 0      # index drift
+sum(imagelib_leader) != 1                                                    # no leader / split brain
+```
+
+Scheduler gauges are only meaningful on the leader (others report 0), so aggregate them with `max`.
+
 ### Logs worth alerting on
 
 | Message | Meaning |
@@ -465,10 +502,11 @@ internal/
   state/               Redis index, LRU, trash, bytes counter (Lua-scripted atomic updates)
   events/              origin-read events: non-blocking, per-key aggregated publisher
   breaker/             consecutive-failure circuit breaker
+  metrics/             Prometheus metric definitions and /metrics registry
   storage/             local root (os.Root) and S3 client
   config/              environment parsing and validation
   database/ cache/     PostgreSQL (incl. embedded schema push) and Redis clients
-  server/              Echo server, /healthz, /livez
+  server/              Echo server, /healthz, /livez, /metrics
 schema/                .gcorm schema (embedded)
 gen/                   generated GCORM client (do not edit)
 scripts/bench.sh       end-to-end load scenarios

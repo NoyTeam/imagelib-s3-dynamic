@@ -126,13 +126,28 @@ func benchHandler(b *testing.B, tier string) (*Handler, string) {
 }
 
 func benchServe(b *testing.B, tier string) {
-	h, payload := benchHandler(b, tier)
+	h, _ := benchHandler(b, tier)
+	benchServeWith(b, h, tier, h.ServeHTTP)
+}
+
+// BenchmarkMetricsOverhead serves the same object with and without the metrics wrapper, so
+// the difference is the instrumentation cost per request.
+func BenchmarkMetricsOverhead(b *testing.B) {
+	for _, tier := range []string{"local", "s3"} {
+		h, _ := benchHandler(b, tier)
+		b.Run(tier+"/instrumented", func(b *testing.B) { benchServeWith(b, h, tier, h.ServeHTTP) })
+		b.Run(tier+"/bare", func(b *testing.B) { benchServeWith(b, h, tier, h.serve) })
+	}
+}
+
+func benchServeWith(b *testing.B, h *Handler, tier string, serve func(http.ResponseWriter, *http.Request)) {
+	payload := strings.Repeat("x", 32<<10)
 	b.SetBytes(int64(len(payload)))
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			rec := httptest.NewRecorder()
-			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/obj.jpg", nil))
+			serve(rec, httptest.NewRequest(http.MethodGet, "/obj.jpg", nil))
 			if rec.Code != 200 || rec.Body.Len() != len(payload) || rec.Header().Get(TierHeader) != tier {
 				b.Fatalf("unexpected %d %d %s", rec.Code, rec.Body.Len(), rec.Header().Get(TierHeader))
 			}

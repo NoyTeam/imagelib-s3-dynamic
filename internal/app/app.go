@@ -9,11 +9,14 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+
 	"imagelib-s3-dynamic/gen/client"
 	"imagelib-s3-dynamic/internal/cache"
 	"imagelib-s3-dynamic/internal/config"
 	"imagelib-s3-dynamic/internal/database"
 	"imagelib-s3-dynamic/internal/events"
+	"imagelib-s3-dynamic/internal/metrics"
 	"imagelib-s3-dynamic/internal/proxy"
 	"imagelib-s3-dynamic/internal/scheduler"
 	"imagelib-s3-dynamic/internal/server"
@@ -93,7 +96,13 @@ func Run(ctx context.Context, cfg config.Config, opts ...Option) error {
 		close(schedDone)
 	}
 
-	srv := server.New(db, rdb, handler)
+	var instance []prometheus.Collector
+	if images != nil {
+		instance = append(instance, images.Collector())
+	}
+	reg := metrics.NewRegistry(instance...)
+
+	srv := server.New(db, rdb, handler, server.WithMetrics(metrics.Handler(reg)))
 	slog.Info("starting", "addr", cfg.Addr, "role", cfg.Role, "instance", cfg.InstanceID,
 		"local", cfg.LocalPath, "s3_capacity", cfg.Scheduler.CapacityBytes)
 	serveErr := srv.Start(ctx, cfg.Addr, o.onListen)
